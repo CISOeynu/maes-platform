@@ -221,12 +221,20 @@ class JobProcessor {
   // Update job progress
   async updateJobProgress(jobId, progress, message) {
     try {
-      const job = await AnalysisJob.findByPk(jobId);
-      if (job) {
-        await job.update({
-          progress,
-          status: progress === 100 ? 'completed' : 'running'
-        });
+      // Use direct SQL for more reliable updates
+      const { execute, getRow } = require('./services/database');
+      
+      // First check if the job exists
+      const jobExists = await getRow('SELECT id FROM maes.analysis_jobs WHERE id = $1', [jobId]);
+      
+      if (jobExists) {
+        await execute(
+          'UPDATE maes.analysis_jobs SET progress = $1, status = $2, updated_at = NOW() WHERE id = $3',
+          [progress, progress === 100 ? 'completed' : 'running', jobId]
+        );
+        logger.info(`Updated job ${jobId} progress: ${progress}% - ${message || ''}`);
+      } else {
+        logger.warn(`Job ${jobId} not found in database for progress update`);
       }
     } catch (error) {
       logger.error(`Failed to update job progress for ${jobId}:`, error);
@@ -236,15 +244,20 @@ class JobProcessor {
   // Handle job completion
   async handleJobCompletion(jobId, data) {
     try {
-      const job = await AnalysisJob.findByPk(jobId);
-      if (job) {
-        await job.update({
-          status: 'completed',
-          progress: 100,
-          completedAt: new Date(),
-          results: data.results,
-          alerts: data.alerts
-        });
+      // Use direct SQL for more reliable updates
+      const { execute, getRow } = require('./services/database');
+      
+      // First check if the job exists
+      const jobExists = await getRow('SELECT id FROM maes.analysis_jobs WHERE id = $1', [jobId]);
+      
+      if (jobExists) {
+        await execute(
+          'UPDATE maes.analysis_jobs SET status = $1, progress = $2, completed_at = $3, results = $4, alerts = $5, updated_at = NOW() WHERE id = $6',
+          ['completed', 100, new Date().toISOString(), JSON.stringify(data.results), JSON.stringify(data.alerts), jobId]
+        );
+        logger.info(`Completed job ${jobId} with ${data.results?.findings?.length || 0} findings and ${data.alerts?.length || 0} alerts`);
+      } else {
+        logger.warn(`Job ${jobId} not found in database for completion update`);
       }
     } catch (error) {
       logger.error(`Failed to handle job completion for ${jobId}:`, error);
@@ -254,13 +267,20 @@ class JobProcessor {
   // Handle job failure
   async handleJobFailure(jobId, error) {
     try {
-      const job = await AnalysisJob.findByPk(jobId);
-      if (job) {
-        await job.update({
-          status: 'failed',
-          errorMessage: error.message,
-          errorDetails: error
-        });
+      // Use direct SQL for more reliable updates
+      const { execute, getRow } = require('./services/database');
+      
+      // First check if the job exists
+      const jobExists = await getRow('SELECT id FROM maes.analysis_jobs WHERE id = $1', [jobId]);
+      
+      if (jobExists) {
+        await execute(
+          'UPDATE maes.analysis_jobs SET status = $1, error_message = $2, error_details = $3, updated_at = NOW() WHERE id = $4',
+          ['failed', error.message, JSON.stringify(error), jobId]
+        );
+        logger.error(`Failed job ${jobId}: ${error.message}`);
+      } else {
+        logger.warn(`Job ${jobId} not found in database for failure update`);
       }
     } catch (updateError) {
       logger.error(`Failed to handle job failure for ${jobId}:`, updateError);

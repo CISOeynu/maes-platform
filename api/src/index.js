@@ -9,6 +9,7 @@ const { Server } = require('socket.io');
 const { pool } = require('./services/database');
 const { logger } = require('./utils/logger');
 const { rateLimiter } = require('./middleware/rateLimiter');
+const { redirectHandler } = require('./middleware/redirectHandler');
 const swaggerSpecs = require('./swagger');
 const elasticsearchService = require('./services/elasticsearch');
 
@@ -36,8 +37,10 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'self'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"], // Allow inline scripts for Swagger UI
       imgSrc: ["'self'", "data:", "https:"],
+      fontSrc: ["'self'", "data:"],
+      connectSrc: ["'self'"],
     },
   },
 }));
@@ -45,17 +48,86 @@ app.use(helmet({
 // Compression middleware
 app.use(compression());
 
-// CORS configuration
-const corsOptions = {
-  origin: [
-    process.env.CORS_ORIGIN || 'https://localhost',
+// CORS configuration - dynamic based on environment variables
+const buildCorsOrigins = () => {
+  const origins = [];
+
+  // Always include localhost for development
+  origins.push(
     'https://localhost',
     'https://localhost:443',
-    'http://localhost:8080', // Keep for backward compatibility
-    'http://localhost'
-  ],
+    'http://localhost:8080',
+    'http://localhost',
+    'http://localhost:3000',
+    'https://localhost:3000'
+  );
+
+  // Add DOMAIN if provided
+  if (process.env.DOMAIN) {
+    const domain = process.env.DOMAIN;
+    origins.push(
+      `https://${domain}`,
+      `http://${domain}`,
+      `https://${domain}:443`,
+      `http://${domain}:80`
+    );
+  }
+
+  // Add PUBLIC_IP if provided
+  if (process.env.PUBLIC_IP) {
+    const publicIP = process.env.PUBLIC_IP;
+    origins.push(
+      `https://${publicIP}`,
+      `http://${publicIP}`,
+      `https://${publicIP}:443`,
+      `http://${publicIP}:80`
+    );
+  }
+
+  // Add FRONTEND_URL if provided
+  if (process.env.FRONTEND_URL) {
+    origins.push(process.env.FRONTEND_URL);
+  }
+
+  // Add explicit CORS_ORIGIN if provided (can be comma-separated)
+  if (process.env.CORS_ORIGIN) {
+    const corsOrigins = process.env.CORS_ORIGIN.split(',').map(origin => origin.trim());
+    origins.push(...corsOrigins);
+  }
+
+  // Add API URL variations
+  if (process.env.API_URL) {
+    origins.push(process.env.API_URL);
+  }
+
+  // Remove duplicates and filter out empty strings
+  return [...new Set(origins.filter(origin => origin && origin.length > 0))];
+};
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    const allowedOrigins = buildCorsOrigins();
+    
+    // Allow requests with no origin (like mobile apps, curl, Postman)
+    if (!origin) {
+      return callback(null, true);
+    }
+    
+    // Check if the origin is in our allowed list
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      // Log for debugging
+      logger.warn(`CORS blocked origin: ${origin}. Allowed origins:`, allowedOrigins);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
   credentials: true,
-  optionsSuccessStatus: 200
+  optionsSuccessStatus: 200,
+  // Allow all headers that might be sent
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'Origin'],
+  exposedHeaders: ['X-Total-Count', 'X-Page', 'X-Per-Page'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH']
 };
 app.use(cors(corsOptions));
 
@@ -73,6 +145,9 @@ app.use(morgan('combined', {
 // Rate limiting
 app.use(rateLimiter);
 
+// Redirect handler middleware
+app.use(redirectHandler);
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -82,8 +157,18 @@ app.get('/health', (req, res) => {
   });
 });
 
-// API documentation
-app.use('/api/docs', swaggerUi.serve, swaggerUi.setup(swaggerSpecs));
+// API documentation with custom options
+const swaggerOptions = {
+  swaggerOptions: {
+    persistAuthorization: true,
+  },
+  customCss: '.swagger-ui .topbar { display: none }',
+  customSiteTitle: 'MAES API Documentation'
+};
+
+// Serve Swagger UI static assets explicitly
+app.use('/api/docs', swaggerUi.serve);
+app.get('/api/docs', swaggerUi.setup(swaggerSpecs, swaggerOptions));
 
 // Routes
 app.use('/api/auth', authRoutes);
@@ -145,8 +230,9 @@ const httpServer = createServer(app);
 // Socket.IO setup
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.CORS_ORIGIN || 'http://localhost:8080',
-    credentials: true
+    origin: buildCorsOrigins(),
+    credentials: true,
+    methods: ['GET', 'POST']
   }
 });
 
