@@ -21,7 +21,7 @@
     "@emotion/react": "^11.11.1",
     "@emotion/styled": "^11.11.0",
     "recharts": "^2.9.0",
-    "dayjs": "^1.11.10",
+    "dayjs": "^1.11.18",
     "react-query": "^3.39.3",
     "zustand": "^4.4.6",
     "react-hook-form": "^7.47.0",
