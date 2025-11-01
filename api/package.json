@@ -27,7 +27,7 @@
     "dotenv": "^16.3.1",
     "jsonwebtoken": "^9.0.2",
     "bcryptjs": "^2.4.3",
-    "express-validator": "^7.0.1",
+    "express-validator": "^7.3.0",
     "pg": "^8.11.3",
     "redis": "^4.6.10",
     "bull": "^4.11.4",
