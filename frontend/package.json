@@ -13,7 +13,7 @@
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.18.0",
-    "axios": "^1.5.1",
+    "axios": "^1.13.5",
     "socket.io-client": "^4.6.2",
     "@mui/material": "^5.14.16",
     "@mui/icons-material": "^5.14.16",
