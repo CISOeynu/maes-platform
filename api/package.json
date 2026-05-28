@@ -32,9 +32,9 @@
   "license": "MIT",
   "dependencies": {
     "archiver": "^7.0.1",
-    "axios": "^1.15.0",
+    "axios": "^1.15.1",
     "bcryptjs": "^3.0.2",
-    "bullmq": "^5.0.0",
+    "bullmq": "^5.58.6",
     "compression": "^1.8.1",
     "cors": "^2.8.5",
     "csv-parser": "^3.2.0",
