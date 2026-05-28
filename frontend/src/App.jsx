@@ -1,21 +1,43 @@
 import React, { useEffect } from 'react'
 import { Routes, Route, Navigate, useNavigate } from 'react-router-dom'
 import { Container, Box } from '@mui/material'
+
+// Component to handle external redirects
+const ExternalRedirect = ({ url }) => {
+  useEffect(() => {
+    window.open(url, '_blank')
+    // Redirect back to dashboard after opening external link
+    window.location.href = '/dashboard'
+  }, [url])
+  
+  return <div>Redirecting to monitoring service...</div>
+}
 import { useAuthStore } from './stores/authStore'
 import { setNavigate } from './utils/axios'
+import { TourProvider } from './contexts/TourContext'
+import { OrganizationProvider } from './contexts/OrganizationContext'
 import Header from './components/Header'
 import Sidebar from './components/Sidebar'
 import SOSButton from './components/SOSButton'
 import Footer from './components/Footer'
+import Tour from './components/Tour'
 import Dashboard from './pages/Dashboard'
 import Extractions from './pages/Extractions'
 import Analysis from './pages/Analysis'
 import Alerts from './pages/Alerts'
 import Reports from './pages/Reports'
 import Settings from './pages/Settings'
+import SIEMConfiguration from './pages/SIEMConfiguration'
 import Login from './pages/Login'
 import Register from './pages/Register'
 import Onboarding from './pages/Onboarding'
+import SystemLogs from './pages/SystemLogs'
+import UserProfile from './pages/UserProfile'
+import UserManagement from './pages/UserManagement'
+import Compliance from './pages/Compliance'
+import Incidents from './pages/Incidents'
+import ThreatIntel from './pages/ThreatIntel'
+import UebaDashboard from './pages/UebaDashboard'
 
 function App() {
   const isAuthenticated = useAuthStore((state) => state.isAuthenticated)
@@ -75,45 +97,65 @@ function App() {
   // Check if user needs onboarding
   if (user?.needsOnboarding) {
     return (
-      <Routes>
-        <Route path="/onboarding" element={<Onboarding />} />
-        <Route path="*" element={<Navigate to="/onboarding" replace />} />
-      </Routes>
+      <OrganizationProvider>
+        <Routes>
+          <Route path="/onboarding" element={<Onboarding />} />
+          <Route path="*" element={<Navigate to="/onboarding" replace />} />
+        </Routes>
+      </OrganizationProvider>
     )
   }
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
-      <Header onMenuClick={toggleSidebar} />
-      <div style={{ display: 'flex', flex: 1 }}>
-        <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
-        <Container 
-          maxWidth={false} 
-          sx={{ 
-            mt: 8, 
-            ml: { xs: 0, sm: '240px' }, // Always account for sidebar on desktop
-            transition: 'margin-left 0.3s',
-            flex: 1,
-            display: 'flex',
-            flexDirection: 'column'
-          }}
-        >
-          <Box sx={{ flex: 1 }}>
-            <Routes>
-              <Route path="/" element={<Navigate to="/dashboard" replace />} />
-              <Route path="/dashboard" element={<Dashboard />} />
-              <Route path="/extractions" element={<Extractions />} />
-              <Route path="/analysis" element={<Analysis />} />
-              <Route path="/alerts" element={<Alerts />} />
-              <Route path="/reports" element={<Reports />} />
-              <Route path="/settings" element={<Settings />} />
-            </Routes>
-          </Box>
-          <Footer />
-        </Container>
+    <OrganizationProvider>
+      <TourProvider>
+        <div style={{ display: 'flex', flexDirection: 'column', minHeight: '100vh' }}>
+          <Header onMenuClick={toggleSidebar} />
+          <div style={{ display: 'flex', flex: 1 }}>
+            <Sidebar open={sidebarOpen} onClose={() => setSidebarOpen(false)} />
+            <Container 
+            maxWidth={false} 
+            sx={{ 
+              mt: 8, 
+              ml: { xs: 0, sm: '240px' }, // Always account for sidebar on desktop
+              transition: 'margin-left 0.3s',
+              flex: 1,
+              display: 'flex',
+              flexDirection: 'column'
+            }}
+          >
+            <Box sx={{ flex: 1 }}>
+              <Routes>
+                <Route path="/" element={<Navigate to="/dashboard" replace />} />
+                <Route path="/dashboard" element={<Dashboard />} />
+                <Route path="/extractions" element={<Extractions />} />
+                <Route path="/analysis" element={<Analysis />} />
+                <Route path="/alerts" element={<Alerts />} />
+                <Route path="/reports" element={<Reports />} />
+                <Route path="/settings" element={<Settings />} />
+                <Route path="/siem" element={<SIEMConfiguration />} />
+                <Route path="/system-logs" element={<SystemLogs />} />
+                <Route path="/profile" element={<UserProfile />} />
+                <Route path="/users" element={<UserManagement />} />
+                <Route path="/compliance" element={<Compliance />} />
+                <Route path="/incidents" element={<Incidents />} />
+                <Route path="/threat-intel" element={<ThreatIntel />} />
+                <Route path="/ueba" element={<UebaDashboard />} />
+                {/* Redirect monitoring service routes to external tabs */}
+                <Route path="/grafana/*" element={<ExternalRedirect url="/grafana/" />} />
+                <Route path="/prometheus/*" element={<ExternalRedirect url="/prometheus/" />} />
+                <Route path="/loki/*" element={<ExternalRedirect url="/loki/" />} />
+                <Route path="/cadvisor/*" element={<ExternalRedirect url="/cadvisor/" />} />
+              </Routes>
+            </Box>
+            <Footer />
+          </Container>
+        </div>
+        <SOSButton />
+        <Tour />
       </div>
-      <SOSButton />
-    </div>
+    </TourProvider>
+  </OrganizationProvider>
   )
 }
 

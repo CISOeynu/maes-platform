@@ -46,32 +46,11 @@ import { useForm, Controller } from 'react-hook-form';
 import { useSnackbar } from 'notistack';
 import dayjs from 'dayjs';
 import axios from '../utils/axios';
-
-const extractionTypes = [
-  { value: 'unified_audit_log', label: 'Unified Audit Log' },
-  { value: 'azure_signin_logs', label: 'Azure Sign-in Logs' },
-  { value: 'azure_audit_logs', label: 'Azure Audit Logs' },
-  { value: 'mfa_status', label: 'MFA Status' },
-  { value: 'oauth_permissions', label: 'OAuth Permissions' },
-  { value: 'risky_users', label: 'Risky Users' },
-  { value: 'risky_detections', label: 'Risky Detections' },
-  { value: 'mailbox_audit', label: 'Mailbox Audit' },
-  { value: 'message_trace', label: 'Message Trace' },
-  { value: 'devices', label: 'Devices' }
-];
-
-const analysisTypes = [
-  { value: 'ual_analysis', label: 'UAL Analysis', description: 'Unified Audit Log analysis for suspicious activities' },
-  { value: 'signin_analysis', label: 'Sign-in Analysis', description: 'Azure AD sign-in pattern analysis' },
-  { value: 'audit_analysis', label: 'Audit Analysis', description: 'Azure AD audit log analysis' },
-  { value: 'mfa_analysis', label: 'MFA Analysis', description: 'Multi-factor authentication analysis' },
-  { value: 'oauth_analysis', label: 'OAuth Analysis', description: 'OAuth application permission analysis' },
-  { value: 'risky_detection_analysis', label: 'Risky Detection Analysis', description: 'Azure AD risky detection analysis' },
-  { value: 'risky_user_analysis', label: 'Risky User Analysis', description: 'Risky user behavior analysis' },
-  { value: 'message_trace_analysis', label: 'Message Trace Analysis', description: 'Email message flow analysis' },
-  { value: 'device_analysis', label: 'Device Analysis', description: 'Device compliance and security analysis' },
-  { value: 'comprehensive_analysis', label: 'Comprehensive Analysis', description: 'Full security analysis across all data sources' }
-];
+import { useOrganization } from '../contexts/OrganizationContext';
+import TourButton from '../components/TourButton';
+import TourResetButton from '../components/TourResetButton';
+import { analysisTourSteps } from '../utils/tourConfigs';
+import { analysisTypes, extractionTypes, uploadableExtractionTypes, getExtractionCapability } from '../utils/platformCapabilities';
 
 const statusColors = {
   pending: 'warning',
@@ -82,6 +61,7 @@ const statusColors = {
 };
 
 const Analysis = () => {
+  const { selectedOrganizationId } = useOrganization();
   const [analysisJobs, setAnalysisJobs] = useState([]);
   const [extractions, setExtractions] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -92,7 +72,7 @@ const Analysis = () => {
   const [uploadFile, setUploadFile] = useState(null);
   const [uploadDataType, setUploadDataType] = useState('unified_audit_log');
   const [uploadMetadata, setUploadMetadata] = useState({});
-  const { control, handleSubmit, reset, watch } = useForm({
+  const { control, handleSubmit, reset, watch, setValue } = useForm({
     defaultValues: {
       extractionId: '',
       type: 'ual_analysis',
@@ -104,11 +84,39 @@ const Analysis = () => {
     }
   });
   const { enqueueSnackbar } = useSnackbar();
+  const selectedExtractionId = watch('extractionId');
+  const selectedExtraction = extractions.find((extraction) => extraction.id === selectedExtractionId);
+  const selectedExtractionAnalysisType = selectedExtraction ? getExtractionCapability(selectedExtraction.type)?.analysisType : null;
+  const availableAnalysisTypes = selectedExtractionAnalysisType
+    ? analysisTypes.filter((type) => type.value === selectedExtractionAnalysisType)
+    : analysisTypes;
+
+  useEffect(() => {
+    if (selectedExtractionAnalysisType) {
+      setValue('type', selectedExtractionAnalysisType);
+    }
+  }, [selectedExtractionAnalysisType, setValue]);
+
+  // Helper function to safely render values that might be objects
+  const safeRenderValue = (value, fallback = 'N/A') => {
+    if (value === null || value === undefined) return fallback;
+    if (typeof value === 'string') return value;
+    if (typeof value === 'number') return value.toString();
+    if (typeof value === 'boolean') return value.toString();
+    try {
+      return JSON.stringify(value);
+    } catch (error) {
+      return fallback;
+    }
+  };
 
   const fetchAnalysisJobs = async () => {
     setLoading(true);
     try {
-      const response = await axios.get('/api/analysis');
+      const url = selectedOrganizationId 
+        ? `/api/analysis?organizationId=${selectedOrganizationId}`
+        : '/api/analysis';
+      const response = await axios.get(url);
       setAnalysisJobs(response.data.analysisJobs);
     } catch (error) {
       enqueueSnackbar('Failed to fetch analysis jobs', { variant: 'error' });
@@ -119,8 +127,11 @@ const Analysis = () => {
 
   const fetchExtractions = async () => {
     try {
-      const response = await axios.get('/api/extractions?status=completed');
-      setExtractions(response.data.extractions);
+      const url = selectedOrganizationId 
+        ? `/api/extractions?status=completed&organizationId=${selectedOrganizationId}`
+        : '/api/extractions?status=completed';
+      const response = await axios.get(url);
+      setExtractions(response.data.extractions.filter((extraction) => getExtractionCapability(extraction.type)?.supportsAnalysis));
     } catch (error) {
       console.error('Failed to fetch extractions:', error);
     }
@@ -135,7 +146,7 @@ const Analysis = () => {
     // Extractions don't change as frequently, so we don't need to poll them
     const interval = setInterval(fetchAnalysisJobs, 5000);
     return () => clearInterval(interval);
-  }, []);
+  }, [selectedOrganizationId]);
 
   const onSubmit = async (data) => {
     try {
@@ -151,6 +162,9 @@ const Analysis = () => {
         }
       };
 
+      console.log('Submitting analysis with payload:', payload);
+      console.log('Current organization ID:', selectedOrganizationId);
+      
       await axios.post('/api/analysis', payload);
       enqueueSnackbar('Analysis job created successfully', { variant: 'success' });
       setDialogOpen(false);
@@ -174,11 +188,33 @@ const Analysis = () => {
   const viewResults = async (id) => {
     try {
       const response = await axios.get(`/api/analysis/${id}/results`);
-      setResults({
+      
+      // Safely process the response data to prevent rendering errors
+      const processedData = {
         id,
         ...response.data
-      });
+      };
+      
+      // Ensure findings array exists and has safe data
+      if (processedData.results?.findings) {
+        processedData.results.findings = processedData.results.findings.map(finding => ({
+          ...finding,
+          title: safeRenderValue(finding.title, 'Unknown Finding'),
+          description: safeRenderValue(finding.description, 'No description available'),
+          severity: finding.severity || 'info'
+        }));
+      }
+      
+      // Ensure recommendations array exists and has safe data
+      if (processedData.results?.recommendations) {
+        processedData.results.recommendations = processedData.results.recommendations.map(rec => 
+          safeRenderValue(rec, 'No recommendation details')
+        );
+      }
+      
+      setResults(processedData);
     } catch (error) {
+      console.error('Error fetching results:', error);
       enqueueSnackbar('Failed to fetch results', { variant: 'error' });
     }
   };
@@ -209,12 +245,22 @@ const Analysis = () => {
         }
       });
 
-      enqueueSnackbar('Logs uploaded successfully', { variant: 'success' });
+      // Check if analysis job was created
+      if (response.data.analysisJob) {
+        enqueueSnackbar('Logs uploaded and analysis started automatically', { variant: 'success' });
+      } else if (response.data.warning) {
+        enqueueSnackbar('Logs uploaded successfully', { variant: 'success' });
+        enqueueSnackbar(response.data.warning, { variant: 'warning' });
+      } else {
+        enqueueSnackbar('Logs uploaded successfully', { variant: 'success' });
+      }
+      
       setUploadDialogOpen(false);
       setUploadFile(null);
       
-      // Refresh extractions to include the uploaded one
+      // Refresh both extractions and analysis jobs to show the new ones
       fetchExtractions();
+      fetchAnalysisJobs();
     } catch (error) {
       enqueueSnackbar(error.response?.data?.error || 'Failed to upload logs', { variant: 'error' });
     }
@@ -334,7 +380,7 @@ const Analysis = () => {
                 </TableCell>
                 <TableCell>
                   <Typography variant="body2">
-                    {job.Extraction?.type || 'Unknown'}
+                    {extractionTypes.find(t => t.value === job.Extraction?.type)?.label || job.Extraction?.type || 'Unknown'}
                   </Typography>
                   <Typography variant="caption" color="text.secondary">
                     {job.Extraction && dayjs(job.Extraction.startDate).format('MMM DD')} - 
@@ -463,7 +509,7 @@ const Analysis = () => {
                     <FormControl fullWidth>
                       <InputLabel>Analysis Type</InputLabel>
                       <Select {...field} label="Analysis Type">
-                        {analysisTypes.map((type) => (
+                        {availableAnalysisTypes.map((type) => (
                           <MenuItem key={type.value} value={type.value}>
                             <Box>
                               <Typography variant="body1">{type.label}</Typography>
@@ -582,85 +628,119 @@ const Analysis = () => {
         >
           <DialogTitle>Analysis Results</DialogTitle>
           <DialogContent>
-            <Grid container spacing={3}>
-              <Grid item xs={12} md={4}>
-                <Card>
-                  <CardContent>
-                    <Typography variant="h6" color="primary">
-                      {results.results?.findings?.length || 0}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Security Findings
-                    </Typography>
-                  </CardContent>
-                </Card>
-              </Grid>
-              <Grid item xs={12} md={4}>
-                <Card>
-                  <CardContent>
-                    <Typography variant="h6" color="warning.main">
-                      {results.alerts?.length || 0}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Alerts Generated
-                    </Typography>
-                  </CardContent>
-                </Card>
-              </Grid>
-              <Grid item xs={12} md={4}>
-                <Card>
-                  <CardContent>
-                    <Typography variant="h6" color="info.main">
-                      {results.results?.statistics?.eventsAnalyzed || 0}
-                    </Typography>
-                    <Typography variant="body2" color="text.secondary">
-                      Events Analyzed
-                    </Typography>
-                  </CardContent>
-                </Card>
-              </Grid>
-              
-              {/* Summary */}
-              <Grid item xs={12}>
-                <Typography variant="h6" gutterBottom>Summary</Typography>
-                <Paper sx={{ p: 2, bgcolor: 'grey.50' }}>
-                  <Typography variant="body2">
-                    {results.results?.summary?.description || 'Analysis completed successfully with no immediate threats detected.'}
-                  </Typography>
-                </Paper>
-              </Grid>
+            {(() => {
+              try {
+                return (
+                  <Grid container spacing={3}>
+                    <Grid item xs={12} md={4}>
+                      <Card>
+                        <CardContent>
+                          <Typography variant="h6" color="primary">
+                            {results.results?.findings?.length || 0}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Security Findings
+                          </Typography>
+                        </CardContent>
+                      </Card>
+                    </Grid>
+                    <Grid item xs={12} md={4}>
+                      <Card>
+                        <CardContent>
+                          <Typography variant="h6" color="warning.main">
+                            {results.alerts?.length || 0}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Alerts Generated
+                          </Typography>
+                        </CardContent>
+                      </Card>
+                    </Grid>
+                    <Grid item xs={12} md={4}>
+                      <Card>
+                        <CardContent>
+                          <Typography variant="h6" color="info.main">
+                            {results.results?.statistics?.eventsAnalyzed || 0}
+                          </Typography>
+                          <Typography variant="body2" color="text.secondary">
+                            Events Analyzed
+                          </Typography>
+                        </CardContent>
+                      </Card>
+                    </Grid>
+                    
+                    {/* Summary */}
+                    <Grid item xs={12}>
+                      <Typography variant="h6" gutterBottom>Summary</Typography>
+                      <Paper sx={{ p: 2, bgcolor: 'grey.50' }}>
+                        <Typography variant="body2">
+                          {safeRenderValue(results.results?.summary?.description, 'Analysis completed successfully with no immediate threats detected.')}
+                        </Typography>
+                      </Paper>
+                    </Grid>
 
-              {/* Findings */}
-              {results.results?.findings?.length > 0 && (
-                <Grid item xs={12}>
-                  <Typography variant="h6" gutterBottom>Key Findings</Typography>
-                  {results.results.findings.map((finding, index) => (
-                    <Alert key={index} severity={finding.severity || 'info'} sx={{ mb: 1 }}>
-                      <Typography variant="body2" fontWeight="bold">
-                        {finding.title}
-                      </Typography>
-                      <Typography variant="body2">
-                        {finding.description}
-                      </Typography>
-                    </Alert>
-                  ))}
-                </Grid>
-              )}
+                    {/* Findings */}
+                    {results.results?.findings?.length > 0 && (
+                      <Grid item xs={12}>
+                        <Typography variant="h6" gutterBottom>Key Findings</Typography>
+                        {results.results.findings.map((finding, index) => (
+                          <Alert key={index} severity={finding.severity || 'info'} sx={{ mb: 1 }}>
+                            <Typography variant="body2" fontWeight="bold">
+                              {safeRenderValue(finding.title, 'Unknown Finding')}
+                            </Typography>
+                            <Typography variant="body2">
+                              {safeRenderValue(finding.description, 'No description available')}
+                            </Typography>
+                            {finding.affectedEntities && (
+                              <Box sx={{ mt: 1 }}>
+                                <Typography variant="caption" color="text.secondary">
+                                  Affected: {finding.affectedEntities.users?.length || 0} users, {finding.affectedEntities.resources?.length || 0} resources
+                                </Typography>
+                              </Box>
+                            )}
+                            {finding.mitreAttack && (
+                              <Box sx={{ mt: 1 }}>
+                                <Typography variant="caption" color="text.secondary">
+                                  MITRE ATT&CK: {Array.isArray(finding.mitreAttack.tactics) ? finding.mitreAttack.tactics.join(', ') : safeRenderValue(finding.mitreAttack.tactics, 'Unknown')}
+                                </Typography>
+                              </Box>
+                            )}
+                          </Alert>
+                        ))}
+                      </Grid>
+                    )}
 
-              {/* Recommendations */}
-              {results.results?.recommendations?.length > 0 && (
-                <Grid item xs={12}>
-                  <Typography variant="h6" gutterBottom>Recommendations</Typography>
-                  <ul>
-                    {results.results.recommendations.map((rec, index) => (
-                      <li key={index}>
-                        <Typography variant="body2">{rec}</Typography>
-                      </li>
-                    ))}
-                  </ul>
-                </Grid>
-              )}
-            </Grid>
+                    {/* Recommendations */}
+                    {results.results?.recommendations?.length > 0 && (
+                      <Grid item xs={12}>
+                        <Typography variant="h6" gutterBottom>Recommendations</Typography>
+                        <ul>
+                          {results.results.recommendations.map((rec, index) => (
+                            <li key={index}>
+                              <Typography variant="body2">
+                                {safeRenderValue(rec, 'No recommendation details')}
+                              </Typography>
+                            </li>
+                          ))}
+                        </ul>
+                      </Grid>
+                    )}
+                  </Grid>
+                );
+              } catch (error) {
+                console.error('Error rendering results:', error);
+                return (
+                  <Alert severity="error" sx={{ mt: 2 }}>
+                    <Typography variant="body2">
+                      Error displaying analysis results. Please try again or contact support.
+                    </Typography>
+                    <Typography variant="caption" color="text.secondary">
+                      Error: {error.message}
+                    </Typography>
+                  </Alert>
+                );
+              }
+            })()}
           </DialogContent>
           <DialogActions>
             <Button onClick={() => setResults(null)}>Close</Button>
@@ -680,15 +760,15 @@ const Analysis = () => {
             <Grid item xs={12}>
               <FormControl fullWidth>
                 <InputLabel>Data Type</InputLabel>
-                <Select
-                  value={uploadDataType}
-                  onChange={(e) => setUploadDataType(e.target.value)}
-                  label="Data Type"
-                >
-                  {extractionTypes.map((type) => (
-                    <MenuItem key={type.value} value={type.value}>
-                      {type.label}
-                    </MenuItem>
+                  <Select
+                    value={uploadDataType}
+                    onChange={(e) => setUploadDataType(e.target.value)}
+                    label="Data Type"
+                  >
+                    {uploadableExtractionTypes.map((type) => (
+                      <MenuItem key={type.value} value={type.value}>
+                        {type.label}
+                      </MenuItem>
                   ))}
                 </Select>
               </FormControl>

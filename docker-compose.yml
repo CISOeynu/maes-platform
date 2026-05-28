@@ -1,16 +1,18 @@
 services:
   postgres:
-    image: timescale/timescaledb:latest-pg14
+    image: timescale/timescaledb:latest-pg14@sha256:0f5553d37abbe0f20bfe0a04dab5d1238955b5cda2711aba403090f95b6e51ff
     container_name: maes-postgres
     environment:
       POSTGRES_DB: maes_db
       POSTGRES_USER: maes_user
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-maes_secure_password}
-    ports:
-      - "5432:5432"
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    # Removed port exposure for security - database only accessible internally
+    # ports:
+    #   - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/init.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./database/02-run-migrations.sh:/docker-entrypoint-initdb.d/02-run-migrations.sh
       - ./database/migrations:/docker-entrypoint-initdb.d/migrations
     networks:
       - maes-network
@@ -22,11 +24,12 @@ services:
       retries: 5
 
   redis:
-    image: redis:7-alpine
+    image: redis:7.4.8-alpine@sha256:8b81dd37ff027bec4e516d41acfbe9fe2460070dc6d4a4570a2ac5b9d59df065
     container_name: maes-redis
-    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_secure_password}
-    ports:
-      - "6379:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+    # Removed port exposure for security - Redis only accessible internally
+    # ports:
+    #   - "6379:6379"
     volumes:
       - redis_data:/data
     networks:
@@ -38,57 +41,26 @@ services:
       timeout: 5s
       retries: 5
 
-  elasticsearch:
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
-    container_name: maes-elasticsearch
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-      - cluster.name=maes-cluster
-      - node.name=maes-node
-      - bootstrap.memory_lock=true
-    ulimits:
-      memlock:
-        soft: -1
-        hard: -1
-    ports:
-      - "9200:9200"
-      - "9300:9300"
-    volumes:
-      - es_data:/usr/share/elasticsearch/data
-      - ./elasticsearch/config/elasticsearch.yml:/usr/share/elasticsearch/config/elasticsearch.yml:ro
-    networks:
-      - maes-network
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 5
-    deploy:
-      resources:
-        limits:
-          memory: 1g
-        reservations:
-          memory: 512m
-
 
   api:
-    build: ./api
+    build:
+      context: .
+      dockerfile: api/Dockerfile
     image: maes-api:latest
     container_name: maes-api
     environment:
       NODE_ENV: ${NODE_ENV:-production}
-      DATABASE_URL: postgresql://maes_user:${POSTGRES_PASSWORD:-maes_secure_password}@postgres:5432/maes_db
-      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_password}@redis:6379
-      ELASTICSEARCH_URL: http://elasticsearch:9200
-      JWT_SECRET: ${JWT_SECRET:-your_jwt_secret_here}
-      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:-service_internal_token_change_in_production}
-      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-your-32-character-secret-key-here!}
+      DATABASE_URL: postgresql://maes_user:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/maes_db
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET}
+      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:?set SERVICE_AUTH_TOKEN}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:?set ENCRYPTION_KEY}
       SIEM_EXPORT_LIMIT: ${SIEM_EXPORT_LIMIT:-1000}
       SIEM_RATE_LIMIT: ${SIEM_RATE_LIMIT:-50}
       PORT: 3000
+      ENABLE_DOCKER_LOGS: ${ENABLE_DOCKER_LOGS:-false}
       # Domain configuration for CORS
       DOMAIN: ${DOMAIN:-localhost}
       PUBLIC_IP: ${PUBLIC_IP:-}
@@ -100,12 +72,12 @@ services:
     #   - "3000:3000"
     volumes:
       - ./certs:/app/certs:ro
+      - extractor_output:/output:ro
+      - user_certificates:/app/uploads/certificates
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      elasticsearch:
         condition: service_healthy
     networks:
       - maes-network
@@ -113,26 +85,35 @@ services:
     command: ${API_COMMAND:-node src/index.js}
 
   extractor:
-    build: ./services/extractor
+    build:
+      context: .
+      dockerfile: services/extractor/Dockerfile
     image: maes-extractor:latest
     container_name: maes-extractor
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_password}@redis:6379
-      DATABASE_URL: postgresql://maes_user:${POSTGRES_PASSWORD:-maes_secure_password}@postgres:5432/maes_db
-      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:-service_internal_token_change_in_production}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      DATABASE_URL: postgresql://maes_user:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/maes_db
+      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:?set SERVICE_AUTH_TOKEN}
+      CERT_PASSWORD: ${CERT_PASSWORD:?set CERT_PASSWORD}
       LOG_LEVEL: ${LOG_LEVEL:-info}
       NODE_ENV: ${NODE_ENV:-production}
       POWERShell_TIMEOUT: ${POWERShell_TIMEOUT:-1800000}
       QUEUE_STALLED_INTERVAL: ${QUEUE_STALLED_INTERVAL:-30000}
       QUEUE_MAX_STALLED_COUNT: ${QUEUE_MAX_STALLED_COUNT:-1}
+      SIDECAR_URL: ${SIDECAR_URL:-http://extractor-sidecar:3001}
     volumes:
       - extractor_output:/output
       - ./certs:/certs:ro
+      - user_certificates:/user_certificates:ro
     depends_on:
       redis:
         condition: service_healthy
       postgres:
         condition: service_healthy
+      extractor-sidecar:
+        condition: service_started
     networks:
       - maes-network
     restart: unless-stopped
@@ -142,15 +123,41 @@ services:
       timeout: 10s
       retries: 3
 
+  extractor-sidecar:
+    build:
+      context: .
+      dockerfile: services/extractor-sidecar/Dockerfile
+    image: maes-extractor-sidecar:latest
+    container_name: maes-extractor-sidecar
+    environment:
+      SIDECAR_PORT: 3001
+      CERT_PASSWORD: ${CERT_PASSWORD:?set CERT_PASSWORD}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      NODE_ENV: ${NODE_ENV:-production}
+    volumes:
+      - extractor_output:/output
+      - ./certs:/certs:ro
+      - user_certificates:/user_certificates:ro
+    networks:
+      - maes-network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "const http = require('http'); const req = http.request('http://127.0.0.1:3001/health', (res) => process.exit(res.statusCode === 200 ? 0 : 1)); req.on('error', () => process.exit(1)); req.end();"]
+      interval: 30s
+      timeout: 10s
+      start_period: 60s
+      retries: 3
+
   analyzer:
     build: ./services/analyzer
     image: maes-analyzer:latest
     container_name: maes-analyzer
     environment:
-      REDIS_URL: redis://:${REDIS_PASSWORD:-redis_secure_password}@redis:6379
-      DATABASE_URL: postgresql://maes_user:${POSTGRES_PASSWORD:-maes_secure_password}@postgres:5432/maes_db
-      ELASTICSEARCH_URL: http://elasticsearch:9200
-      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:-service_internal_token_change_in_production}
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      DATABASE_URL: postgresql://maes_user:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/maes_db
+      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:?set SERVICE_AUTH_TOKEN}
     volumes:
       - extractor_output:/output:ro
       - analyzer_output:/analyzer_output
@@ -159,14 +166,38 @@ services:
         condition: service_healthy
       postgres:
         condition: service_healthy
-      elasticsearch:
+    networks:
+      - maes-network
+    restart: unless-stopped
+
+  compliance:
+    build: ./services/compliance
+    image: maes-compliance:latest
+    container_name: maes-compliance
+    environment:
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD}
+      DATABASE_URL: postgresql://maes_user:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/maes_db
+      SERVICE_AUTH_TOKEN: ${SERVICE_AUTH_TOKEN:?set SERVICE_AUTH_TOKEN}
+      COMPLIANCE_PORT: 3002
+      LOG_LEVEL: info
+    volumes:
+      - ./certs:/certs:ro
+      - compliance-reports:/app/reports
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     networks:
       - maes-network
     restart: unless-stopped
 
   frontend:
-    build: ./frontend
+    build:
+      context: .
+      dockerfile: frontend/Dockerfile
     image: maes-frontend:latest
     container_name: maes-frontend
     environment:
@@ -185,12 +216,114 @@ services:
       - maes-network
     restart: unless-stopped
 
+  # Monitoring Stack
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: maes-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+      - '--storage.tsdb.retention.time=30d'
+      - '--web.enable-lifecycle'
+      - '--web.external-url=https://localhost/prometheus/'
+      - '--web.route-prefix=/'
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - maes-network
+    restart: unless-stopped
+    depends_on:
+      - api
+      - extractor
+      - analyzer
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    container_name: maes-grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:?set GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_SERVER_ROOT_URL=https://localhost/grafana/
+      - GF_SERVER_SERVE_FROM_SUB_PATH=true
+      - GF_SERVER_STATIC_ROOT_PATH=/usr/share/grafana/public
+      - GF_SERVER_ENABLE_GZIP=true
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      - maes-network
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
+  loki:
+    image: grafana/loki:3.3.1
+    container_name: maes-loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./monitoring/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki_data:/loki
+    networks:
+      - maes-network
+    restart: unless-stopped
+
+  promtail:
+    image: grafana/promtail:3.3.1
+    container_name: maes-promtail
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./monitoring/promtail-config.yml:/etc/promtail/config.yml:ro
+      - /var/log:/var/log:ro
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+    networks:
+      - maes-network
+    restart: unless-stopped
+    depends_on:
+      - loki
+
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:v0.50.0
+    container_name: maes-cadvisor
+    # Removed privileged mode for security - may reduce some monitoring capabilities
+    # privileged: true
+    devices:
+      - /dev/kmsg:/dev/kmsg
+    volumes:
+      # Reduced volume mounts for security - only essential monitoring directories
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker:/var/lib/docker:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      # Removed full root filesystem mount for security
+      # - /:/rootfs:ro
+    ports:
+      - "8080:8080"
+    networks:
+      - maes-network
+    restart: unless-stopped
+
 volumes:
   postgres_data:
   redis_data:
-  es_data:
   extractor_output:
   analyzer_output:
+  prometheus_data:
+  grafana_data:
+  loki_data:
+  user_certificates:
+  compliance-reports:
 
 networks:
   maes-network:

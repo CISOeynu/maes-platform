@@ -1,288 +1,238 @@
-# MAES: The M365 Analyzer & Extractor Suite
+# MAES Platform
 
-<div align="center">
-  <img src="MAES_Logo.png" alt="MAES Logo" width="300" />
-</div>
+MAES is a Microsoft 365 extraction, analysis, reporting, and compliance platform with built-in security operations capabilities including UEBA, case management, automated playbooks, and threat intelligence enrichment.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Docker](https://img.shields.io/badge/Docker-Ready-blue.svg)](https://www.docker.com/)
+## Version
 
-**MAES: The M365 Analyzer & Extractor Suite** is an open-source, full-stack SaaS platform for Microsoft 365 forensic data extraction and analysis.
+- Current release: **v1.3.0**
+- Upstream extractor reference: [`invictus-ir/Microsoft-Extractor-Suite`](https://github.com/invictus-ir/Microsoft-Extractor-Suite) (Tier 3 Exchange-only sidecar)
+- Upstream analyzer reference: [`LETHAL-FORENSICS/Microsoft-Analyzer-Suite`](https://github.com/LETHAL-FORENSICS/Microsoft-Analyzer-Suite)
 
-> **⚠️ This project is heavily under development**
+## What's New in v1.3.0
 
-**Built on the amazing work of:**
-- [Microsoft-Analyzer-Suite](https://github.com/LETHAL-FORENSICS/Microsoft-Analyzer-Suite) - Give them a STAR! ⭐
-- [Microsoft-Extractor-Suite](https://github.com/invictus-ir/Microsoft-Extractor-Suite) - Give them a STAR! ⭐
+### Native Graph API Extraction Engine
+The extractor service now calls Microsoft Graph API directly via `@azure/msal-node` + `@microsoft/microsoft-graph-client` for 23 of 28 extraction types, eliminating the PowerShell runtime dependency and reducing the Docker image by ~300-500 MB. A lightweight PowerShell sidecar (`extractor-sidecar`) handles the 5 Exchange-only types that have no Graph API equivalent.
 
-## 🚀 Features
+### Dual-Path Extraction Architecture
+| Path | Types | Implementation |
+|------|-------|---------------|
+| Tier 1 — Native Graph | 20 types (sign-in logs, audit logs, MFA, devices, groups, licenses, conditional access, PIM, risky users, etc.) | Direct Graph SDK calls with `@odata.nextLink` pagination and 429 rate limit retry |
+| Tier 2 — Partial Graph | 3 types (mailbox rules, mailbox audit status, mailbox permissions) | Graph API with documented limitations |
+| Tier 3 — PowerShell Sidecar | 5 types (unified audit log, admin audit log, mailbox audit, transport rules, message trace) | HTTP API sidecar running `Microsoft-Extractor-Suite` |
 
-- **M365 Data Extraction**: Audit logs, Azure AD, Exchange, SharePoint, Teams
-- **Advanced Analytics**: MITRE ATT&CK mapping, behavioral analysis, threat hunting
-- **Upload & Analyze**: Support for pre-extracted log files (JSON, CSV, TXT, LOG)
-- **Elasticsearch Integration**: Full-text search and real-time analytics
-- **Security & Compliance**: Multi-tenant, RBAC, audit logging
-- **Enterprise-Ready**: Docker containerization, microservices architecture
-- **Real-time Progress**: Live analysis progress tracking with WebSocket updates
+### Native Certificate Parsing
+PFX/PKCS12 certificate validation in the API service now uses `node-forge` instead of spawning `pwsh`. Certificate thumbprint, expiry, and private key extraction are handled entirely in JavaScript.
 
-## 🚦 Quick Start
+### Event-Driven Progress Tracking
+Replaced stdout regex parsing with a `ProgressTracker` class that updates BullMQ job progress through phase-based events (authenticating, fetching, paginating, writing).
 
-### Prerequisites
-- Docker Desktop or Docker Engine
-- Docker Compose
-- 8GB+ RAM recommended
-- 20GB+ free disk space
-- For production: Custom domain with DNS pointing to your server
+### Output Format v2.0
+Native Graph extractors produce output in Graph API's native JSON format with a metadata envelope (format version, extraction type, timestamp, record count) for format detection by downstream services.
 
-### Installation
+See [CHANGELOG.md](CHANGELOG.md) for full details.
 
-#### 🏠 Localhost Development (Default)
+## What's New in v1.2.0
+
+### UEBA (User Entity Behavior Analytics)
+Behavioral baselines built from 30-day audit history, with geographic, temporal, and operational anomaly detection. Risk scores (0–100) drive automated recommendations and high-risk alerting.
+
+### Case Management
+Full incident lifecycle — new → investigating → contained → resolved → closed — with timeline tracking, evidence management, and user assignment.
+
+### Automated Playbooks
+Three built-in playbooks (Compromised Account, Phishing Email, Privileged Access Abuse) with approval gates for destructive actions and database-backed execution tracking.
+
+### Threat Intelligence Integration
+Multi-provider IOC enrichment (VirusTotal, AbuseIPDB, Shodan, IPQualityScore) for IPs, domains, and file hashes. Saved IOC tracking with risk-level classification and 1-hour caching.
+
+### Bug Fixes
+- Eliminated duplicate `require()` calls and duplicate `app` declarations that would crash startup
+- Fixed broken sidebar menu array, duplicate frontend routes, and duplicate imports
+- Replaced insecure `pool.query('BEGIN')` transactions with proper client-based transactions
+- Parameterized SQL query in `getUserCountries()` (was injectable)
+- Fixed route ordering so `/stats/summary` and `/meta/playbooks` match before `/:id`
+- Aligned RBAC permission names across all new routes to the actual system permissions
+
+See [CHANGELOG.md](CHANGELOG.md) and [docs/releases/v1.2.0.md](docs/releases/v1.2.0.md) for full details.
+
+## Architecture
+
+- `api/`: authentication, orchestration, uploads, reporting, UEBA, incidents, threat intel
+- `frontend/`: React UI behind nginx
+- `services/extractor/`: Microsoft 365 extraction worker (native Graph API + PowerShell sidecar dispatcher)
+- `services/extractor-sidecar/`: PowerShell sidecar for Exchange-only extractions (unified audit log, admin audit, mailbox audit, transport rules, message trace)
+- `services/analyzer/`: analysis worker
+- `services/compliance/`: compliance assessment worker and report service
+- `database/`: bootstrap schema and migrations
+- `shared/`: capability metadata used across services
+
+## Prerequisites
+
+- Docker Engine with Compose support
+- Microsoft 365 tenant credentials for extraction/compliance workflows
+- A `.env` file with explicit secrets
+
+## Required Secrets
+
+Set these in `.env` before starting the stack:
+
 ```bash
-git clone https://github.com/ionsec/maes-platform.git
-cd maes-platform
-docker-compose up -d --build
+POSTGRES_PASSWORD=
+REDIS_PASSWORD=
+JWT_SECRET=
+SERVICE_AUTH_TOKEN=
+ENCRYPTION_KEY=
+CERT_PASSWORD=
+GRAFANA_PASSWORD=
 ```
 
-**Access**: https://localhost (accept self-signed certificate)
+Recommended generation commands:
 
-#### 🌍 Production with Custom Domain
 ```bash
-git clone https://github.com/ionsec/maes-platform.git
-cd maes-platform
-
-# Set up environment variables
-cp .env.example .env
-# Edit .env with your domain and secure passwords
-
-# One-command setup with Let's Encrypt SSL
-./scripts/setup-domain.sh maes.yourdomain.com admin@yourdomain.com
+openssl rand -hex 24   # POSTGRES_PASSWORD / REDIS_PASSWORD
+openssl rand -hex 32   # JWT_SECRET / SERVICE_AUTH_TOKEN / ENCRYPTION_KEY / CERT_PASSWORD / GRAFANA_PASSWORD
 ```
 
-**Access**: https://maes.yourdomain.com
+Notes:
 
-### Initial Setup
+- `ENCRYPTION_KEY` must be at least 32 characters.
+- `SERVICE_AUTH_TOKEN` is required for internal API calls between services.
+- `CERT_PASSWORD` protects the default extractor certificate bundle.
+- There is no seeded `admin@maes.local / admin123` account.
 
-1. **Apply database migrations** (if needed):
-   ```bash
-   docker exec -i maes-postgres psql -U maes_user -d maes_db < database/migrations/update_user_roles_fixed.sql
-   ```
+## Optional Threat Intelligence API Keys
 
-2. **Access the application**:
-   - **Web Interface**: https://localhost (dev) or https://yourdomain.com (prod)
-   - **API Documentation**: https://localhost/api/docs (proxied via nginx)
-   - **Default Login**: admin@maes.local / admin123
+These enable external IOC enrichment; the platform runs without them (enrichment endpoints return empty results):
 
-## 🔒 SSL & Domain Configuration
-
-MAES supports flexible SSL configuration:
-
-| Mode | Use Case | SSL | Command |
-|------|----------|-----|---------|
-| **Localhost** | Development | Self-signed | `docker-compose up -d` |
-| **Production** | Custom domain | Let's Encrypt | `./scripts/setup-domain.sh domain.com email@domain.com` |
-| **Staging** | Testing | Let's Encrypt Staging | `./scripts/setup-domain.sh domain.com email@domain.com --staging` |
-
-### Environment Configuration
-
-Copy and customize the environment file:
 ```bash
-cp .env.example .env
-# Edit .env with your domain and settings
+VIRUSTOTAL_API_KEY=        # VirusTotal file hash and domain reputation
+ABUSEIPDB_API_KEY=         # AbuseIPDB IP reputation
+SHODAN_API_KEY=            # Shodan IP exposure and vulnerability data
+IPQUALITYSCORE_API_KEY=    # IPQualityScore fraud and abuse scoring
 ```
 
-**Required environment variables for production:**
+## Deployment
+
+1. Clone the repository.
+2. Create `.env` from `.env.example`.
+3. Fill in all required secrets.
+4. Start the stack:
+
 ```bash
-# Domain Configuration
-DOMAIN=yourdomain.com              # Your domain (e.g., maes-demo.ionsec.io)
-USE_LETS_ENCRYPT=true             # Enable Let's Encrypt
-EMAIL=admin@yourdomain.com        # Required for Let's Encrypt
-
-# CORS Configuration (automatically configured based on DOMAIN)
-# PUBLIC_IP=1.2.3.4               # Alternative: Use public IP instead of domain
-# FRONTEND_URL=https://your-frontend-url.com  # Alternative: Explicit frontend URL
-# CORS_ORIGIN=https://domain1.com,https://domain2.com  # Manual override
-
-# Security (CHANGE THESE!)
-POSTGRES_PASSWORD=your_secure_postgres_password
-REDIS_PASSWORD=your_secure_redis_password
-JWT_SECRET=your_jwt_secret_min_32_characters
-SERVICE_AUTH_TOKEN=your_service_token
-ENCRYPTION_KEY=your-32-character-secret-key-here!
-
-# Database
-DATABASE_URL=postgresql://maes_user:your_secure_postgres_password@postgres:5432/maes_db
-
-# Redis
-REDIS_URL=redis://:your_secure_redis_password@redis:6379
-
-# API Configuration
-NODE_ENV=production
-PORT=3000  # Internal port only (not exposed publicly)
-API_URL=https://yourdomain.com  # Frontend API URL (nginx proxies /api/ internally)
+docker compose up -d --build
 ```
 
-**Frontend configuration (frontend/.env):**
+5. Apply database migrations:
+
 ```bash
-# Point frontend to your domain (nginx proxies API internally)
-VITE_API_URL=https://yourdomain.com
+docker compose exec -T postgres psql -U maes_user -d maes_db \
+  < database/migrations/007_add_ueba_incidents_playbooks.sql
+docker compose exec -T postgres psql -U maes_user -d maes_db \
+  < database/migrations/008_add_saved_iocs.sql
 ```
 
-## 📊 Using MAES
+6. Open the platform at `https://localhost` for local deployment, or your configured domain for production.
+7. Create the first administrator account through the registration flow.
 
-### M365 Data Extraction
-1. **Register an Organization**: Set up Azure AD app registration
-2. **Configure Credentials**: Add tenant ID, client ID, and certificate
-3. **Run Extractions**: Choose data types (UAL, Azure logs, etc.)
-4. **Monitor Progress**: Real-time extraction status
+## First-Time Setup
 
-### Analysis & Upload Options
+- Register the first user through the MAES UI.
+- Complete onboarding and create the first organization.
+- Configure Microsoft Entra / Microsoft 365 application credentials.
+- Upload a certificate or use the extractor-managed default certificate.
+- Run a connection test before scheduling extractions.
+- Optionally configure threat intelligence API keys in `.env` for IOC enrichment.
 
-#### Option 1: Direct Analysis (Connected)
-- Connect to Microsoft 365 directly
-- Extract and analyze in real-time
-- Automatic analysis triggering
+## API Endpoints
 
-#### Option 2: Upload Pre-extracted Logs (Standalone)
-- Upload existing log files (JSON, CSV, TXT, LOG)
-- Support for various M365 log formats
-- No M365 connection required
+### Authentication & Core
 
-**To upload logs:**
-1. Go to **Analysis** page
-2. Click **"Upload Logs"**
-3. Select data type (UAL, Azure Sign-in, etc.)
-4. Choose your log file
-5. Set optional metadata (date ranges)
-6. Run analysis on uploaded data
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/auth/login` | Authenticate user |
+| `GET` | `/api/extractions` | List extractions |
+| `POST` | `/api/extractions` | Start extraction |
+| `GET` | `/api/analysis` | List analysis jobs |
+| `POST` | `/api/analysis` | Create analysis job |
+| `GET` | `/api/alerts` | List security alerts |
+| `GET` | `/api/reports` | List reports |
 
-**Supported file formats:**
-- **JSON**: Native M365 export format
-- **CSV**: Tabular log data
-- **TXT/LOG**: Plain text logs
+### UEBA
 
-### Real-time Features
-- **Live Progress Tracking**: See extraction/analysis progress in real-time
-- **WebSocket Updates**: Instant status updates across the platform
-- **CORS Support**: Works with localhost and custom domains
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/ueba/baseline/:userId` | Get user behavior baseline |
+| `GET` | `/api/ueba/risk/:userId` | Get user risk score |
+| `GET` | `/api/ueba/baselines` | List all baselines |
+| `POST` | `/api/ueba/process-activity` | Process activity for anomalies |
+| `GET` | `/api/ueba/stats` | UEBA statistics |
 
-## 🛠️ Development
+### Incident Management
 
-### Local Development with Hot-reloading
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/incidents` | List incidents |
+| `POST` | `/api/incidents` | Create incident |
+| `GET` | `/api/incidents/stats/summary` | Incident statistics |
+| `GET` | `/api/incidents/meta/playbooks` | List available playbooks |
+| `GET` | `/api/incidents/:id` | Get incident details |
+| `PUT` | `/api/incidents/:id/status` | Update incident status |
+| `PUT` | `/api/incidents/:id/assign` | Assign incident |
+| `POST` | `/api/incidents/:id/evidence` | Add evidence |
+| `POST` | `/api/incidents/:id/playbook` | Execute playbook |
 
-#### Method 1: Using Development Override (Recommended)
-```bash
-# Start with development configuration (exposes API port 3000)
-docker-compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build
+### Threat Intelligence
 
-# Access API directly at: http://localhost:3000/api/docs
-# Access frontend at: https://localhost
-```
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/threat-intel/enrich/ip/:ip` | Enrich IP address |
+| `GET` | `/api/threat-intel/enrich/domain/:domain` | Enrich domain |
+| `GET` | `/api/threat-intel/enrich/hash/:hash` | Enrich file hash |
+| `POST` | `/api/threat-intel/enrich/bulk` | Bulk enrichment |
+| `GET` | `/api/threat-intel/stats` | Provider status and cache size |
+| `GET` | `/api/threat-intel/saved` | List saved IOCs |
+| `POST` | `/api/threat-intel/saved` | Save an IOC |
+| `DELETE` | `/api/threat-intel/saved/:id` | Delete saved IOC |
 
-#### Method 2: Manual Development Setup
-Add this to your `.env` file:
-```bash
-API_COMMAND=npm run dev
-```
+## Security Posture
 
-Then restart the API container:
-```bash
-docker compose restart api
-```
+- Services fail fast when required secrets are missing.
+- No seeded default admin account.
+- No hardcoded fallback internal service tokens.
+- Docker log collection is disabled unless explicitly enabled.
+- CSP and CORS defaults are tight in production mode.
+- Container image references are pinned.
+- All SQL queries use parameterized inputs.
+- All new API endpoints enforce RBAC permissions and rate limiting.
 
-**Note**: In production, port 3000 is not exposed publicly. All API requests go through nginx proxy at `/api/`
+## Optional Docker Log Access
 
-### Building for Production
-```bash
-# Build and tag images
-docker compose build
-docker tag maes-api:latest your-registry/maes-api:latest
-docker tag maes-frontend:latest your-registry/maes-frontend:latest
-docker tag maes-extractor:latest your-registry/maes-extractor:latest
-docker tag maes-analyzer:latest your-registry/maes-analyzer:latest
+System log collection from Docker containers is not enabled by default. To enable it:
 
-# Push to registry
-docker push your-registry/maes-api:latest
-docker push your-registry/maes-frontend:latest
-docker push your-registry/maes-extractor:latest
-docker push your-registry/maes-analyzer:latest
-```
+1. Set `ENABLE_DOCKER_LOGS=true` in the API environment.
+2. Restore a read-only Docker socket mount for the API service.
+3. Accept that this increases the privilege level of that container.
 
-## 🔧 Troubleshooting
+If you do not enable it, `/api/system/logs` returns `503`.
 
-### Services Not Starting
-- Check logs: `docker compose logs <service-name>`
-- Ensure all environment variables are set correctly
-- Verify port availability (80, 443, 5432, 6379, 9200)
-- **Note**: Port 3000 is internal only (not exposed in production)
+## Development
 
-### Registration Issues
-- Ensure database migrations have been applied
-- Check API logs for specific errors
-- Verify Azure AD app registration permissions
+- Frontend: `cd frontend && npm install && npm run dev`
+- API: `cd api && npm install && npm run dev`
+- Services: run their respective `npm install` and `npm start` commands
 
-### Analysis Not Showing Progress
-- Check that analysis jobs are created in database
-- Verify analyzer service is processing jobs
-- Check WebSocket connection in browser dev tools
+For local development, you may set development-only origins with `CORS_ORIGIN` or run with `NODE_ENV=development`.
 
-### Performance Issues
-- Adjust Elasticsearch memory: Update `ES_JAVA_OPTS` in docker-compose
-- Monitor resource usage: `docker stats`
-- Check available disk space for logs and data
+## Documentation
 
-### CORS Issues
-- **Common error**: "Access to XMLHttpRequest blocked by CORS policy"
-- **Solution**: Set `DOMAIN` environment variable to your deployment domain
-- **Example**: For deployment on `maes-demo.ionsec.io`:
-  ```bash
-  DOMAIN=maes-demo.ionsec.io
-  API_URL=https://maes-demo.ionsec.io
-  ```
-- **Frontend**: Ensure `VITE_API_URL=https://maes-demo.ionsec.io` (no port 3000)
-- **Alternative**: Use `PUBLIC_IP` for IP-based deployments or `CORS_ORIGIN` for manual override
-- **Development**: Use `docker-compose.dev.yml` to expose port 3000 for direct API access
-- Check API logs for CORS-related errors: `docker logs maes-api`
+- [Environment Variables](docs/ENVIRONMENT_VARIABLES.md)
+- [Domain Setup](docs/DOMAIN_SETUP.md)
+- [Monitoring](docs/MONITORING.md)
+- [Monitoring Quick Reference](docs/MONITORING_QUICK_REFERENCE.md)
+- [API Documentation](docs/API_DOCUMENTATION.md)
+- [Release Notes: v1.1.0](docs/releases/v1.1.0.md)
+- [Release Notes: v1.2.0](docs/releases/v1.2.0.md)
 
-## 📋 Backup & Maintenance
+## License
 
-### Database Backup
-```bash
-# Backup PostgreSQL database
-docker exec maes-postgres pg_dump -U maes_user maes_db > backup.sql
-
-# Restore database
-docker exec -i maes-postgres psql -U maes_user maes_db < backup.sql
-```
-
-### Health Monitoring
-```bash
-# Check all services status
-docker compose ps
-
-# View service logs
-docker compose logs -f <service-name>
-
-# Monitor resource usage
-docker stats
-```
-
-### Cleanup
-```bash
-# Clean up old containers and images
-docker system prune -f
-
-# Remove volumes (WARNING: This deletes all data)
-docker compose down -v
-```
-
-## 🤝 Contributing
-
-We welcome contributions! Please see our [Contributing Guide](CONTRIBUTING.md) for details.
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-**MAES Platform** - Microsoft 365 Forensic Analysis Made Simple
+MIT

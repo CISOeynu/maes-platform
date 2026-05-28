@@ -38,12 +38,14 @@ import {
   Launch,
   Close,
   SkipNext,
-  Download
+  Download,
+  AdminPanelSettings
 } from '@mui/icons-material'
 import { useNavigate } from 'react-router-dom'
 import axios from '../utils/axios'
 import { useAuth } from '../contexts/AuthContext'
 import { useAuthStore } from '../stores/authStore'
+import { useOrganization } from '../contexts/OrganizationContext'
 
 const Onboarding = () => {
   const [activeStep, setActiveStep] = useState(0)
@@ -54,6 +56,12 @@ const Onboarding = () => {
   const [showDocumentation, setShowDocumentation] = useState(false)
   const navigate = useNavigate()
   const { user } = useAuth()
+  const { 
+    organizations, 
+    selectedOrganizationId, 
+    selectOrganization, 
+    refreshOrganizations 
+  } = useOrganization()
 
   // Form data
   const [organizationData, setOrganizationData] = useState({
@@ -62,10 +70,15 @@ const Onboarding = () => {
     tenantId: ''
   })
   
+  const [currentOrgIndex, setCurrentOrgIndex] = useState(0)
+  const [isAddingMultipleOrgs, setIsAddingMultipleOrgs] = useState(false)
+  
   const [credentialsData, setCredentialsData] = useState({
     applicationId: '',
     clientSecret: '',
     certificateThumbprint: '',
+    certificateFile: null,
+    certificatePassword: '',
     authMethod: 'client_secret'
   })
 
@@ -76,43 +89,34 @@ const Onboarding = () => {
   })
 
   useEffect(() => {
-    // For individual users or users with default organization, allow onboarding
-    // Only redirect if user has a properly configured organization and completed onboarding
-    if (user?.organization?.name && 
-        user.organization.name !== 'MAES Default Organization' &&
-        !user.needsOnboarding) {
-      // User already has organization setup and completed onboarding, redirect to dashboard
+    // Check if user has any real organizations and completed onboarding
+    if (organizations && organizations.length > 0 && !user?.needsOnboarding) {
+      // User has organizations and completed onboarding, redirect to dashboard
       navigate('/dashboard')
     }
-  }, [user, navigate])
+    // Otherwise stay in onboarding to create first organization
+  }, [organizations, user, navigate])
 
-  const isIndividualUser = !user?.organization || user?.organization?.name === 'MAES Default Organization';
+  // Check if this is the first time setup (no organizations exist)
+  const isFirstTimeSetup = !organizations || organizations.length === 0;
   
-  const steps = isIndividualUser ? [
-    {
-      label: 'Welcome to MAES',
-      description: 'Get started with your individual MAES account'
-    },
-    {
-      label: 'Microsoft 365 Setup (Optional)',
-      description: 'Configure Microsoft 365 credentials for data extraction'
-    },
-    {
-      label: 'Complete Setup',
-      description: 'Finalize configuration and start using MAES'
-    }
-  ] : [
+  // All users must create an organization - no individual user flow
+  const steps = [
     {
       label: 'Welcome & Security',
-      description: 'Change default password and learn about MAES'
+      description: 'Review security setup and finalize your administrator account'
     },
     {
-      label: 'Organization Setup',
-      description: 'Configure your Microsoft 365 organization details'
+      label: 'Create Your Organization',
+      description: 'Set up your Microsoft 365 organization (Required)'
     },
     {
       label: 'Azure App Registration',
       description: 'Set up authentication credentials for M365 access'
+    },
+    {
+      label: 'Tenant Consent',
+      description: 'Grant admin consent for application permissions'
     },
     {
       label: 'Test Connection',
@@ -128,12 +132,14 @@ const Onboarding = () => {
     setActiveStep((prevActiveStep) => prevActiveStep + 1)
     setError('')
     setSuccess('')
+    setTestConnectionResult(null) // Clear any previous test results
   }
 
   const handleBack = () => {
     setActiveStep((prevActiveStep) => prevActiveStep - 1)
     setError('')
     setSuccess('')
+    setTestConnectionResult(null)
   }
 
   const handlePasswordChange = async () => {
@@ -170,24 +176,50 @@ const Onboarding = () => {
 
     setLoading(true)
     try {
-      const updateData = {
+      const orgData = {
         name: organizationData.name,
         fqdn: organizationData.fqdn
       }
       
       // Only include tenantId if it's provided and looks like a UUID
       if (organizationData.tenantId && organizationData.tenantId.match(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i)) {
-        updateData.tenantId = organizationData.tenantId
+        orgData.tenantId = organizationData.tenantId
       }
       
-      await axios.put('/api/organizations/current', updateData)
-      setSuccess('Organization details updated successfully!')
+      // Always create a new organization (not update)
+      const response = await axios.post('/api/organizations', orgData)
+      
+      // Refresh the organizations list in the global context
+      await refreshOrganizations()
+      
+      // Select the newly created organization
+      if (response.data.organization) {
+        await selectOrganization(response.data.organization.id)
+      }
+      
+      setSuccess('Organization created successfully!')
       setTimeout(() => handleNext(), 2000)
     } catch (error) {
-      setError(error.response?.data?.error || 'Failed to update organization')
+      setError(error.response?.data?.error || 'Failed to create organization')
     } finally {
       setLoading(false)
     }
+  }
+
+  const handleAddAnotherOrg = () => {
+    setIsAddingMultipleOrgs(true)
+    setOrganizationData({ name: '', fqdn: '', tenantId: '' })
+    setError('')
+    setSuccess('')
+  }
+
+  const handleFinishAddingOrgs = () => {
+    if (!organizations || organizations.length === 0) {
+      setError('Please add at least one organization')
+      return
+    }
+    setSuccess(`${organizations.length} organization(s) configured successfully!`)
+    setTimeout(() => handleNext(), 2000)
   }
 
   const handleCredentialsSetup = async () => {
@@ -201,11 +233,10 @@ const Onboarding = () => {
       return
     }
 
-    // Certificate thumbprint is optional since we have hardcoded certificates
-    // if (credentialsData.authMethod === 'certificate' && !credentialsData.certificateThumbprint) {
-    //   setError('Certificate Thumbprint is required for this authentication method')
-    //   return
-    // }
+    if (!selectedOrganizationId) {
+      setError('No organization selected. Please complete organization setup first.')
+      return
+    }
 
     setLoading(true)
     try {
@@ -222,7 +253,16 @@ const Onboarding = () => {
         }
       }
 
-      await axios.put('/api/organizations/current/credentials', credentials)
+      // Save credentials to the selected organization
+      await axios.put('/api/organizations/current/credentials', credentials, {
+        headers: {
+          'x-organization-id': selectedOrganizationId
+        }
+      })
+      
+      // Refresh organization data to ensure Settings sees the changes
+      await refreshOrganizations()
+      
       setSuccess('Credentials configured successfully!')
       setTimeout(() => handleNext(), 2000)
     } catch (error) {
@@ -233,11 +273,20 @@ const Onboarding = () => {
   }
 
   const handleTestConnection = async () => {
+    if (!selectedOrganizationId) {
+      setError('No organization selected. Please complete organization setup first.')
+      return
+    }
+    
     setLoading(true)
     setTestConnectionResult(null)
     try {
       // Get current organization data to test with
-      const orgResponse = await axios.get('/api/organizations/current?showCredentials=true')
+      const orgResponse = await axios.get('/api/organizations/current?showCredentials=true', {
+        headers: {
+          'x-organization-id': selectedOrganizationId
+        }
+      })
       const org = orgResponse.data.organization
       
       const testParams = {
@@ -268,10 +317,32 @@ const Onboarding = () => {
   }
 
   const handleSkipOnboarding = async () => {
+    if (loading) return; // Prevent multiple calls
+    
     setLoading(true)
+    setError('')
+    setSuccess('')
+    
+    let timeoutId;
     try {
+      // Set a safety timeout
+      timeoutId = setTimeout(() => {
+        setError('API call is taking too long. Proceeding to dashboard anyway...');
+        setLoading(false);
+        // Still navigate to dashboard even if API fails
+        setTimeout(() => {
+          useAuthStore.getState().updateUser({ needsOnboarding: false });
+          navigate('/dashboard');
+        }, 2000);
+      }, 15000); // 15 second timeout
+      
       // Call API to mark onboarding as complete
-      await axios.post('/api/auth/complete-onboarding')
+      await axios.post('/api/auth/complete-onboarding', {}, {
+        timeout: 10000 // 10 second timeout for this API call
+      })
+      
+      // Clear safety timeout
+      if (timeoutId) clearTimeout(timeoutId);
       
       // Update the auth store to reflect the change
       useAuthStore.getState().updateUser({ needsOnboarding: false })
@@ -279,17 +350,52 @@ const Onboarding = () => {
       setSuccess('Onboarding skipped! You can configure settings later in the Settings page.')
       setTimeout(() => navigate('/dashboard'), 2000)
     } catch (error) {
-      setError('Failed to complete onboarding. Please try again.')
+      console.error('Error skipping onboarding:', error);
+      
+      // Clear safety timeout
+      if (timeoutId) clearTimeout(timeoutId);
+      
+      // If API fails, still allow user to proceed to dashboard
+      if (error.code === 'ECONNABORTED' || error.message?.includes('timeout') || error.message?.includes('Network error')) {
+        setSuccess('API unavailable, but proceeding to dashboard. You can complete setup later in Settings.')
+        useAuthStore.getState().updateUser({ needsOnboarding: false })
+        setTimeout(() => navigate('/dashboard'), 2000)
+      } else {
+        setError(error.response?.data?.error || 'Failed to complete onboarding. Please try again or refresh the page.')
+      }
     } finally {
       setLoading(false)
+      if (timeoutId) clearTimeout(timeoutId);
     }
   }
 
   const handleCompleteOnboarding = async () => {
+    if (loading) return; // Prevent multiple calls
+    
     setLoading(true)
+    setError('')
+    setSuccess('')
+    
+    let timeoutId;
     try {
+      // Set a safety timeout
+      timeoutId = setTimeout(() => {
+        setError('API call is taking too long. Proceeding to dashboard anyway...');
+        setLoading(false);
+        // Still navigate to dashboard even if API fails
+        setTimeout(() => {
+          useAuthStore.getState().updateUser({ needsOnboarding: false });
+          navigate('/dashboard');
+        }, 2000);
+      }, 15000); // 15 second timeout
+      
       // Call API to mark onboarding as complete
-      await axios.post('/api/auth/complete-onboarding')
+      await axios.post('/api/auth/complete-onboarding', {}, {
+        timeout: 10000 // 10 second timeout for this API call
+      })
+      
+      // Clear safety timeout
+      if (timeoutId) clearTimeout(timeoutId);
       
       // Update the auth store to reflect the change
       useAuthStore.getState().updateUser({ needsOnboarding: false })
@@ -297,9 +403,22 @@ const Onboarding = () => {
       setSuccess('Onboarding completed! Redirecting to dashboard...')
       setTimeout(() => navigate('/dashboard'), 2000)
     } catch (error) {
-      setError('Failed to complete onboarding. Please try again.')
+      console.error('Error completing onboarding:', error);
+      
+      // Clear safety timeout
+      if (timeoutId) clearTimeout(timeoutId);
+      
+      // If API fails, still allow user to proceed to dashboard
+      if (error.code === 'ECONNABORTED' || error.message?.includes('timeout') || error.message?.includes('Network error')) {
+        setSuccess('API unavailable, but proceeding to dashboard. You can complete setup later in Settings.')
+        useAuthStore.getState().updateUser({ needsOnboarding: false })
+        setTimeout(() => navigate('/dashboard'), 2000)
+      } else {
+        setError(error.response?.data?.error || 'Failed to complete onboarding. Please try again or refresh the page.')
+      }
     } finally {
       setLoading(false)
+      if (timeoutId) clearTimeout(timeoutId);
     }
   }
 
@@ -326,10 +445,10 @@ const Onboarding = () => {
   }
 
   const renderStepContent = (step) => {
-    if (isIndividualUser) {
-      switch (step) {
-        case 0:
-          return (
+    // Organization-based flow (all users must create organizations)
+    switch (step) {
+      case 0:
+        return (
             <Box>
               <Card sx={{ mb: 3 }}>
                 <CardContent>
@@ -357,7 +476,7 @@ const Onboarding = () => {
                   <Alert severity="info" sx={{ mt: 2 }}>
                     <Typography variant="body2">
                       As an individual user, you can use MAES for analysis and reporting. 
-                      You can optionally configure Microsoft 365 credentials later to enable data extraction.
+                      You can configure credentials for multiple Microsoft 365 organizations to enable comprehensive data extraction and monitoring.
                     </Typography>
                   </Alert>
                 </CardContent>
@@ -373,9 +492,13 @@ const Onboarding = () => {
                 </Button>
                 <Button
                   variant="outlined"
-                  onClick={handleCompleteOnboarding}
+                  onClick={() => {
+                    setError('');
+                    handleSkipOnboarding();
+                  }}
                   startIcon={<SkipNext />}
                   color="secondary"
+                  disabled={loading}
                 >
                   Skip to Dashboard
                 </Button>
@@ -453,41 +576,170 @@ const Onboarding = () => {
               )}
 
               {credentialsData.authMethod === 'certificate' && (
-                <TextField
-                  label="Certificate Thumbprint (Optional)"
-                  fullWidth
-                  margin="normal"
-                  value={credentialsData.certificateThumbprint}
-                  onChange={(e) => setCredentialsData({...credentialsData, certificateThumbprint: e.target.value})}
-                  placeholder="Leave empty to use default certificate"
-                  helperText="Optional: Only provide if using a custom certificate"
-                />
+                <Box>
+                  <Alert severity="info" sx={{ mb: 2 }}>
+                    <strong>Certificate Options:</strong> You can upload your own .pfx certificate or use the default certificate. 
+                    If uploading, provide both the certificate file and password.
+                  </Alert>
+                  
+                  <Box sx={{ display: 'flex', gap: 2, mb: 2 }}>
+                    <Button
+                      variant="outlined"
+                      component="label"
+                      fullWidth
+                      sx={{ py: 1.5 }}
+                    >
+                      {credentialsData.certificateFile ? 
+                        `Selected: ${credentialsData.certificateFile.name}` : 
+                        'Upload Certificate (.pfx)'
+                      }
+                      <input
+                        type="file"
+                        hidden
+                        accept=".pfx,.p12"
+                        onChange={(e) => {
+                          const file = e.target.files[0];
+                          setCredentialsData({...credentialsData, certificateFile: file});
+                        }}
+                      />
+                    </Button>
+                    {credentialsData.certificateFile && (
+                      <Button
+                        variant="outlined"
+                        color="error"
+                        onClick={() => setCredentialsData({
+                          ...credentialsData, 
+                          certificateFile: null, 
+                          certificatePassword: ''
+                        })}
+                      >
+                        Remove
+                      </Button>
+                    )}
+                  </Box>
+
+                  {credentialsData.certificateFile && (
+                    <TextField
+                      label="Certificate Password"
+                      fullWidth
+                      margin="normal"
+                      type="password"
+                      value={credentialsData.certificatePassword}
+                      onChange={(e) => setCredentialsData({...credentialsData, certificatePassword: e.target.value})}
+                      placeholder="Enter certificate password"
+                      helperText="Password for the uploaded .pfx certificate"
+                      required
+                    />
+                  )}
+
+                  <TextField
+                    label="Certificate Thumbprint (Optional)"
+                    fullWidth
+                    margin="normal"
+                    value={credentialsData.certificateThumbprint}
+                    onChange={(e) => setCredentialsData({...credentialsData, certificateThumbprint: e.target.value})}
+                    placeholder="Leave empty to use default certificate"
+                    helperText="Optional: Only provide if using a custom certificate"
+                  />
+                </Box>
               )}
 
-              <Box sx={{ mt: 2, display: 'flex', gap: 2 }}>
+              <Box sx={{ mt: 2, display: 'flex', gap: 2, flexWrap: 'wrap' }}>
                 <Button
                   variant="contained"
                   onClick={async () => {
+                    if (loading) return; // Prevent multiple clicks
+                    
+                    setError(''); // Clear any previous errors
+                    setSuccess('');
+                    
                     if (credentialsData.applicationId || organizationData.tenantId || organizationData.fqdn) {
                       // Save credentials to user preferences
+                      let timeoutId;
                       try {
                         setLoading(true)
+                        
+                        // Set a safety timeout to prevent infinite loading
+                        timeoutId = setTimeout(() => {
+                          setError('Operation is taking too long. Please try again or use "Save Without Certificate".');
+                          setLoading(false);
+                        }, 150000); // 2.5 minutes safety timeout
+                        
+                        // Upload certificate first if provided
+                        let certificateUploadResult = null;
+                        let certificateUploadFailed = false;
+                        if (credentialsData.certificateFile && credentialsData.certificatePassword) {
+                          try {
+                            setSuccess('Uploading certificate...')
+                            const formData = new FormData();
+                            formData.append('certificate', credentialsData.certificateFile);
+                            formData.append('password', credentialsData.certificatePassword);
+                            
+                            // Use longer timeout for certificate uploads
+                            certificateUploadResult = await axios.post('/api/user/certificate', formData, {
+                              headers: { 'Content-Type': 'multipart/form-data' },
+                              timeout: 120000 // 2 minutes timeout for certificate upload
+                            });
+                            setSuccess('Certificate uploaded, saving preferences...')
+                          } catch (certError) {
+                            console.error('Certificate upload failed:', certError);
+                            certificateUploadFailed = true;
+                            if (certError.code === 'ECONNABORTED' || certError.message?.includes('timeout')) {
+                              setSuccess('Certificate upload timed out, saving other preferences without certificate...')
+                            } else {
+                              setSuccess('Certificate upload failed, saving other preferences without certificate...')
+                            }
+                          }
+                        }
+                        
+                        // Prepare user preferences object
                         const preferences = {
                           tenantId: organizationData.tenantId,
                           fqdn: organizationData.fqdn,
                           applicationId: credentialsData.applicationId || '574cfe92-60a1-4271-9c80-8aba00070e67',
+                          authMethod: credentialsData.authMethod,
                           ...(credentialsData.clientSecret && { clientSecret: credentialsData.clientSecret }),
                           ...(credentialsData.certificateThumbprint && { certificateThumbprint: credentialsData.certificateThumbprint }),
+                          ...(certificateUploadResult && { 
+                            certificateFilePath: certificateUploadResult.data.certificate?.filePath || certificateUploadResult.data.filePath,
+                            certificateThumbprint: certificateUploadResult.data.certificate?.thumbprint,
+                            certificatePassword: credentialsData.certificatePassword
+                          }),
                           credentialsConfiguredAt: new Date().toISOString()
                         }
                         
-                        await axios.put('/api/users/profile', { preferences })
-                        setSuccess('Credentials saved successfully!')
-                        setTimeout(() => handleNext(), 1500)
+                        // Save to user preferences
+                        setSuccess('Saving preferences...');
+                        await axios.put('/api/user/preferences', { preferences }, {
+                          timeout: 30000 // 30 second timeout for preferences save
+                        });
+                        
+                        // Clear safety timeout since operation completed
+                        if (timeoutId) clearTimeout(timeoutId);
+                        
+                        if (certificateUploadFailed) {
+                          setSuccess('Credentials saved successfully! Note: Certificate upload failed and was skipped. You can upload it later in Settings.')
+                        } else {
+                          setSuccess('Credentials saved successfully!')
+                        }
+                        setTimeout(() => handleNext(), 2000)
                       } catch (error) {
-                        setError('Failed to save credentials')
+                        console.error('Error saving credentials:', error);
+                        
+                        // Clear safety timeout
+                        if (timeoutId) clearTimeout(timeoutId);
+                        
+                        if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+                          setError('Operation timed out. Please try again or use "Save Without Certificate".')
+                        } else if (error.code === 'ERR_NETWORK') {
+                          setError('Network error. Please check your connection and try again.')
+                        } else {
+                          setError(error.response?.data?.error || error.message || 'Failed to save credentials')
+                        }
                       } finally {
+                        // Ensure loading is always reset
                         setLoading(false)
+                        if (timeoutId) clearTimeout(timeoutId);
                       }
                     } else {
                       handleNext()
@@ -497,6 +749,74 @@ const Onboarding = () => {
                   startIcon={loading ? <CircularProgress size={20} /> : <VpnKey />}
                 >
                   {loading ? 'Saving...' : 'Save & Continue'}
+                </Button>
+                <Button
+                  variant="outlined"
+                  onClick={async () => {
+                    if (loading) return; // Prevent multiple clicks
+                    
+                    setError('');
+                    setSuccess('');
+                    
+                    if (credentialsData.applicationId || organizationData.tenantId || organizationData.fqdn) {
+                      let timeoutId;
+                      try {
+                        setLoading(true)
+                        
+                        // Set a safety timeout
+                        timeoutId = setTimeout(() => {
+                          setError('Operation is taking too long. Please try again.');
+                          setLoading(false);
+                        }, 60000); // 1 minute safety timeout
+                        
+                        setSuccess('Saving credentials without certificate...')
+                        
+                        const preferences = {
+                          tenantId: organizationData.tenantId,
+                          fqdn: organizationData.fqdn,
+                          applicationId: credentialsData.applicationId || '574cfe92-60a1-4271-9c80-8aba00070e67',
+                          authMethod: credentialsData.authMethod,
+                          ...(credentialsData.clientSecret && { clientSecret: credentialsData.clientSecret }),
+                          ...(credentialsData.certificateThumbprint && { certificateThumbprint: credentialsData.certificateThumbprint }),
+                          credentialsConfiguredAt: new Date().toISOString()
+                        }
+                        
+                        await axios.put('/api/user/preferences', { preferences }, {
+                          timeout: 30000 // 30 second timeout
+                        });
+                        
+                        // Clear safety timeout
+                        if (timeoutId) clearTimeout(timeoutId);
+                        
+                        setSuccess('Credentials saved successfully (certificate skipped)!')
+                        setTimeout(() => handleNext(), 1500)
+                      } catch (error) {
+                        console.error('Error saving credentials:', error);
+                        
+                        // Clear safety timeout
+                        if (timeoutId) clearTimeout(timeoutId);
+                        
+                        if (error.code === 'ECONNABORTED' || error.message?.includes('timeout')) {
+                          setError('Operation timed out. Please try again.')
+                        } else if (error.code === 'ERR_NETWORK') {
+                          setError('Network error. Please check your connection and try again.')
+                        } else {
+                          setError(error.response?.data?.error || error.message || 'Failed to save credentials')
+                        }
+                      } finally {
+                        // Ensure loading is always reset
+                        setLoading(false)
+                        if (timeoutId) clearTimeout(timeoutId);
+                      }
+                    } else {
+                      handleNext()
+                    }
+                  }}
+                  disabled={loading}
+                  startIcon={<VpnKey />}
+                  color="secondary"
+                >
+                  Save Without Certificate
                 </Button>
                 <Button
                   variant="outlined"
@@ -565,427 +885,6 @@ const Onboarding = () => {
             </Box>
           )
 
-        default:
-          return 'Unknown step'
-      }
-    }
-    
-    // Original organization-based flow
-    switch (step) {
-      case 0:
-        return (
-          <Box>
-            <Alert severity="warning" sx={{ mb: 3 }}>
-              <Typography variant="h6" gutterBottom>Security First!</Typography>
-              <Typography>
-                You're currently using the default password. For security reasons, please change it immediately.
-              </Typography>
-            </Alert>
-
-            <Card sx={{ mb: 3 }}>
-              <CardContent>
-                <Typography variant="h6" gutterBottom color="primary.main">
-                  Welcome to MAES Platform
-                </Typography>
-                <Typography variant="body2" color="text.secondary" paragraph>
-                  The M365 Analyzer & Extractor Suite - A comprehensive platform for Microsoft 365 forensic analysis and incident response.
-                </Typography>
-                
-                <Box sx={{ 
-                  display: 'flex', 
-                  alignItems: 'center',
-                  justifyContent: 'center',
-                  mt: 2, mb: 2
-                }}>
-                  <Chip 
-                    label="Powered by IONSEC.IO" 
-                    color="primary" 
-                    variant="outlined"
-                    sx={{ fontWeight: 'bold' }}
-                  />
-                </Box>
-
-                <Typography variant="body2" color="text.secondary">
-                  This onboarding will guide you through:
-                </Typography>
-                <List dense>
-                  <ListItem>
-                    <ListItemIcon><Security fontSize="small" /></ListItemIcon>
-                    <ListItemText primary="Securing your account" />
-                  </ListItem>
-                  <ListItem>
-                    <ListItemIcon><Business fontSize="small" /></ListItemIcon>
-                    <ListItemText primary="Setting up your organization" />
-                  </ListItem>
-                  <ListItem>
-                    <ListItemIcon><VpnKey fontSize="small" /></ListItemIcon>
-                    <ListItemText primary="Configuring M365 authentication" />
-                  </ListItem>
-                  <ListItem>
-                    <ListItemIcon><CheckCircle fontSize="small" /></ListItemIcon>
-                    <ListItemText primary="Testing the connection" />
-                  </ListItem>
-                </List>
-              </CardContent>
-            </Card>
-
-            <Typography variant="h6" gutterBottom>Change Your Password</Typography>
-            <TextField
-              label="Current Password"
-              type="password"
-              fullWidth
-              margin="normal"
-              value={passwordData.currentPassword}
-              onChange={(e) => setPasswordData({...passwordData, currentPassword: e.target.value})}
-            />
-            <TextField
-              label="New Password"
-              type="password"
-              fullWidth
-              margin="normal"
-              value={passwordData.newPassword}
-              onChange={(e) => setPasswordData({...passwordData, newPassword: e.target.value})}
-            />
-            <TextField
-              label="Confirm New Password"
-              type="password"
-              fullWidth
-              margin="normal"
-              value={passwordData.confirmPassword}
-              onChange={(e) => setPasswordData({...passwordData, confirmPassword: e.target.value})}
-            />
-            
-            <Box sx={{ mt: 2, display: 'flex', gap: 2 }}>
-              <Button
-                variant="contained"
-                onClick={handlePasswordChange}
-                disabled={loading || !passwordData.currentPassword || !passwordData.newPassword || !passwordData.confirmPassword}
-                startIcon={loading ? <CircularProgress size={20} /> : <Security />}
-              >
-                {loading ? 'Changing Password...' : 'Change Password'}
-              </Button>
-              <Button
-                variant="outlined"
-                onClick={handleNext}
-                disabled={loading}
-                startIcon={<SkipNext />}
-                color="secondary"
-              >
-                Skip for Now
-              </Button>
-            </Box>
-          </Box>
-        )
-
-      case 1:
-        return (
-          <Box>
-            <Alert severity="info" sx={{ mb: 3 }}>
-              <Typography variant="body2">
-                Configure your organization details to connect to Microsoft 365. The FQDN is typically your tenant domain (e.g., yourcompany.onmicrosoft.com).
-              </Typography>
-            </Alert>
-
-            <TextField
-              label="Organization Name"
-              fullWidth
-              margin="normal"
-              value={organizationData.name}
-              onChange={(e) => setOrganizationData({...organizationData, name: e.target.value})}
-              placeholder="Your Company Name"
-              required
-            />
-            <TextField
-              label="Tenant FQDN"
-              fullWidth
-              margin="normal"
-              value={organizationData.fqdn}
-              onChange={(e) => setOrganizationData({...organizationData, fqdn: e.target.value})}
-              placeholder="yourcompany.onmicrosoft.com"
-              required
-              helperText="Your Microsoft 365 tenant domain (FQDN)"
-            />
-            <TextField
-              label="Tenant ID (Optional)"
-              fullWidth
-              margin="normal"
-              value={organizationData.tenantId}
-              onChange={(e) => setOrganizationData({...organizationData, tenantId: e.target.value})}
-              placeholder="12345678-1234-1234-1234-123456789012"
-              helperText="Azure AD Tenant ID (GUID) - Optional if FQDN is provided"
-            />
-
-            <Box sx={{ mt: 2, display: 'flex', gap: 2 }}>
-              <Button
-                variant="contained"
-                onClick={handleOrganizationSetup}
-                disabled={loading || !organizationData.name || !organizationData.fqdn}
-                startIcon={loading ? <CircularProgress size={20} /> : <Business />}
-              >
-                {loading ? 'Saving...' : 'Save Organization Details'}
-              </Button>
-              <Button
-                variant="outlined"
-                onClick={handleNext}
-                disabled={loading}
-                startIcon={<SkipNext />}
-                color="secondary"
-              >
-                Skip for Now
-              </Button>
-            </Box>
-          </Box>
-        )
-
-      case 2:
-        return (
-          <Box>
-            <Alert severity="warning" sx={{ mb: 3 }}>
-              <Typography variant="body2">
-                You need to register an application in Azure AD and grant it the necessary permissions. 
-                <Link 
-                  href="#" 
-                  onClick={() => setShowDocumentation(true)}
-                  sx={{ ml: 1 }}
-                >
-                  View setup guide
-                </Link>
-              </Typography>
-            </Alert>
-
-            <Typography variant="h6" gutterBottom>Authentication Method</Typography>
-            <Box sx={{ mb: 2 }}>
-              <Button
-                variant={credentialsData.authMethod === 'client_secret' ? 'contained' : 'outlined'}
-                onClick={() => setCredentialsData({...credentialsData, authMethod: 'client_secret'})}
-                sx={{ mr: 1 }}
-              >
-                Client Secret
-              </Button>
-              <Button
-                variant={credentialsData.authMethod === 'certificate' ? 'contained' : 'outlined'}
-                onClick={() => setCredentialsData({...credentialsData, authMethod: 'certificate'})}
-              >
-                Certificate
-              </Button>
-            </Box>
-
-            <TextField
-              label="Application (Client) ID"
-              fullWidth
-              margin="normal"
-              value={credentialsData.applicationId}
-              onChange={(e) => setCredentialsData({...credentialsData, applicationId: e.target.value})}
-              placeholder="12345678-1234-1234-1234-123456789012"
-              required
-            />
-
-            {credentialsData.authMethod === 'client_secret' && (
-              <TextField
-                label="Client Secret"
-                type="password"
-                fullWidth
-                margin="normal"
-                value={credentialsData.clientSecret}
-                onChange={(e) => setCredentialsData({...credentialsData, clientSecret: e.target.value})}
-                placeholder="Your client secret value"
-                required
-              />
-            )}
-
-            {credentialsData.authMethod === 'certificate' && (
-              <Box>
-                <Alert severity="info" sx={{ mb: 2 }}>
-                  <Typography variant="body2">
-                    <strong>Certificate Thumbprint is Optional!</strong> The extractor service includes pre-configured certificates (app.pfx, app.crt). 
-                    You can leave this field empty to use the default certificate, or provide your own certificate thumbprint.
-                  </Typography>
-                </Alert>
-                
-                <Box sx={{ mb: 2 }}>
-                  <Button
-                    variant="outlined"
-                    onClick={handleDownloadCertificate}
-                    startIcon={<Download />}
-                    size="small"
-                    color="primary"
-                  >
-                    Download Certificate (app.crt)
-                  </Button>
-                  <Typography variant="caption" display="block" sx={{ mt: 1, color: 'text.secondary' }}>
-                    Download this certificate to upload to your Azure App Registration
-                  </Typography>
-                </Box>
-                
-                <TextField
-                  label="Certificate Thumbprint (Optional)"
-                  fullWidth
-                  margin="normal"
-                  value={credentialsData.certificateThumbprint}
-                  onChange={(e) => setCredentialsData({...credentialsData, certificateThumbprint: e.target.value})}
-                  placeholder="Leave empty to use default certificate"
-                  helperText="Optional: Only provide if you want to use a custom certificate instead of the default one"
-                />
-              </Box>
-            )}
-
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 2, mb: 2 }}>
-              Required API Permissions:
-            </Typography>
-            <List dense>
-              <ListItem>
-                <ListItemIcon><CheckCircle fontSize="small" color="success" /></ListItemIcon>
-                <ListItemText primary="Exchange.ManageAsApp" secondary="For Exchange Online access" />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon><CheckCircle fontSize="small" color="success" /></ListItemIcon>
-                <ListItemText primary="Directory.Read.All" secondary="For Azure AD access" />
-              </ListItem>
-              <ListItem>
-                <ListItemIcon><CheckCircle fontSize="small" color="success" /></ListItemIcon>
-                <ListItemText primary="AuditLog.Read.All" secondary="For audit log access" />
-              </ListItem>
-            </List>
-
-            <Box sx={{ mt: 2, display: 'flex', gap: 2 }}>
-              <Button
-                variant="contained"
-                onClick={handleCredentialsSetup}
-                disabled={loading || !credentialsData.applicationId || 
-                  (credentialsData.authMethod === 'client_secret' && !credentialsData.clientSecret)
-                }
-                startIcon={loading ? <CircularProgress size={20} /> : <VpnKey />}
-              >
-                {loading ? 'Saving...' : 'Save Credentials'}
-              </Button>
-              <Button
-                variant="outlined"
-                onClick={handleNext}
-                disabled={loading}
-                startIcon={<SkipNext />}
-                color="secondary"
-              >
-                Skip for Now
-              </Button>
-            </Box>
-          </Box>
-        )
-
-      case 3:
-        return (
-          <Box>
-            <Alert severity="info" sx={{ mb: 3 }}>
-              <Typography variant="body2">
-                Let's test the connection to Microsoft 365 to ensure everything is configured correctly.
-              </Typography>
-            </Alert>
-
-            {testConnectionResult && (
-              <Card sx={{ mb: 3 }}>
-                <CardContent>
-                  <Typography variant="h6" gutterBottom>
-                    Connection Test Results
-                  </Typography>
-                  {testConnectionResult.success ? (
-                    <Alert severity="success">
-                      <Typography variant="body2">
-                        ✅ Successfully connected to Microsoft 365
-                      </Typography>
-                      {testConnectionResult.ualStatus && (
-                        <Typography variant="body2" sx={{ mt: 1 }}>
-                          UAL Status: {testConnectionResult.ualStatus}
-                        </Typography>
-                      )}
-                    </Alert>
-                  ) : (
-                    <Alert severity="error">
-                      <Typography variant="body2">
-                        ❌ Connection failed: {testConnectionResult.error}
-                      </Typography>
-                    </Alert>
-                  )}
-                </CardContent>
-              </Card>
-            )}
-
-            <Box sx={{ mt: 2, display: 'flex', gap: 2 }}>
-              <Button
-                variant="contained"
-                onClick={handleTestConnection}
-                disabled={loading}
-                startIcon={loading ? <CircularProgress size={20} /> : <Launch />}
-                size="large"
-              >
-                {loading ? 'Testing Connection...' : 'Test M365 Connection'}
-              </Button>
-              <Button
-                variant="outlined"
-                onClick={handleNext}
-                disabled={loading}
-                startIcon={<SkipNext />}
-                color="secondary"
-                size="large"
-              >
-                Skip Test
-              </Button>
-            </Box>
-          </Box>
-        )
-
-      case 4:
-        return (
-          <Box>
-            <Alert severity="success" sx={{ mb: 3 }}>
-              <Typography variant="h6" gutterBottom>🎉 Setup Complete!</Typography>
-              <Typography variant="body2">
-                Your MAES platform is now configured and ready to use. You can start extracting and analyzing Microsoft 365 data.
-              </Typography>
-            </Alert>
-
-            <Card sx={{ mb: 3 }}>
-              <CardContent>
-                <Typography variant="h6" gutterBottom>Next Steps:</Typography>
-                <List>
-                  <ListItem>
-                    <ListItemIcon><CloudUpload /></ListItemIcon>
-                    <ListItemText 
-                      primary="Start Data Extraction" 
-                      secondary="Go to Extractions page to begin collecting M365 audit logs"
-                    />
-                  </ListItem>
-                  <ListItem>
-                    <ListItemIcon><Settings /></ListItemIcon>
-                    <ListItemText 
-                      primary="Configure Analysis Rules" 
-                      secondary="Customize security detection rules for your organization"
-                    />
-                  </ListItem>
-                  <ListItem>
-                    <ListItemIcon><Security /></ListItemIcon>
-                    <ListItemText 
-                      primary="Monitor Alerts" 
-                      secondary="Review security alerts and findings from your analysis"
-                    />
-                  </ListItem>
-                </List>
-              </CardContent>
-            </Card>
-
-            <Box sx={{ mt: 2 }}>
-              <Button
-                variant="contained"
-                onClick={handleCompleteOnboarding}
-                size="large"
-                fullWidth
-                disabled={loading}
-                startIcon={loading ? <CircularProgress size={20} /> : <CheckCircle />}
-              >
-                {loading ? 'Completing Setup...' : 'Go to Dashboard'}
-              </Button>
-            </Box>
-          </Box>
-        )
-
       default:
         return 'Unknown step'
     }
@@ -1038,16 +937,36 @@ const Onboarding = () => {
                 </Typography>
               </Box>
             </Box>
-            <Box sx={{ display: 'flex', justifyContent: 'center', gap: 2 }}>
+            <Box sx={{ display: 'flex', justifyContent: 'center', gap: 2, flexWrap: 'wrap' }}>
               <Button
                 variant="outlined"
-                onClick={handleSkipOnboarding}
+                onClick={() => {
+                  setError('');
+                  setSuccess('');
+                  handleSkipOnboarding();
+                }}
                 startIcon={<SkipNext />}
                 size="small"
                 color="secondary"
+                disabled={loading}
               >
                 Skip Setup & Go to Dashboard
               </Button>
+              {error && (
+                <Button
+                  variant="outlined"
+                  onClick={() => {
+                    // Force skip - bypass all API calls
+                    useAuthStore.getState().updateUser({ needsOnboarding: false });
+                    navigate('/dashboard');
+                  }}
+                  startIcon={<Launch />}
+                  size="small"
+                  color="warning"
+                >
+                  Force Skip (Emergency)
+                </Button>
+              )}
             </Box>
           </Box>
 
@@ -1087,12 +1006,32 @@ const Onboarding = () => {
                       {index < steps.length - 1 && !loading && (
                         <Button
                           variant="outlined"
-                          onClick={handleSkipOnboarding}
+                          onClick={() => {
+                            setError('');
+                            setSuccess('');
+                            handleSkipOnboarding();
+                          }}
                           sx={{ mt: 1, mr: 1 }}
                           color="secondary"
                           startIcon={<SkipNext />}
                         >
                           Skip Setup
+                        </Button>
+                      )}
+                      {error && (
+                        <Button
+                          variant="outlined"
+                          onClick={() => {
+                            // Force skip - bypass all API calls
+                            useAuthStore.getState().updateUser({ needsOnboarding: false });
+                            navigate('/dashboard');
+                          }}
+                          sx={{ mt: 1, mr: 1 }}
+                          color="warning"
+                          startIcon={<Launch />}
+                          size="small"
+                        >
+                          Force Skip
                         </Button>
                       )}
                     </div>

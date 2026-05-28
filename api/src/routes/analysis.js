@@ -5,6 +5,7 @@ const { authenticateToken, requirePermission } = require('../middleware/auth');
 const { apiRateLimiter } = require('../middleware/rateLimiter');
 const { createAnalysisJob } = require('../services/jobService');
 const { logger } = require('../utils/logger');
+const { analysisTypes, getAutoAnalysisType, isAnalyzableExtraction } = require('../utils/platformCapabilities');
 
 const router = express.Router();
 
@@ -12,18 +13,7 @@ const router = express.Router();
 router.post('/internal', 
   [
     body('extractionId').isUUID().withMessage('Valid extraction ID is required'),
-    body('type').isIn([
-      'ual_analysis',
-      'signin_analysis',
-      'audit_analysis',
-      'mfa_analysis',
-      'oauth_analysis',
-      'risky_detection_analysis',
-      'risky_user_analysis',
-      'message_trace_analysis',
-      'device_analysis',
-      'comprehensive_analysis'
-    ]).withMessage('Invalid analysis type'),
+    body('type').isIn(analysisTypes).withMessage('Invalid analysis type'),
     body('priority').optional().isIn(['low', 'medium', 'high', 'critical']).withMessage('Invalid priority'),
     body('parameters').optional().isObject().withMessage('Parameters must be an object')
   ],
@@ -66,6 +56,19 @@ router.post('/internal',
         });
       }
 
+      const recommendedAnalysisType = getAutoAnalysisType(extraction.type);
+      if (!recommendedAnalysisType) {
+        return res.status(400).json({
+          error: `Extraction type '${extraction.type}' does not support analysis`
+        });
+      }
+
+      if (type !== recommendedAnalysisType) {
+        return res.status(400).json({
+          error: `Extraction type '${extraction.type}' must use analysis type '${recommendedAnalysisType}'`
+        });
+      }
+
       // Create analysis job record
       const analysisJob = await AnalysisJob.create({
         extractionId,
@@ -104,18 +107,7 @@ router.post('/internal/direct',
     body('id').isUUID().withMessage('Valid job ID is required'),
     body('extractionId').isUUID().withMessage('Valid extraction ID is required'),
     body('organizationId').isUUID().withMessage('Valid organization ID is required'),
-    body('type').isIn([
-      'ual_analysis',
-      'signin_analysis',
-      'audit_analysis',
-      'mfa_analysis',
-      'oauth_analysis',
-      'risky_detection_analysis',
-      'risky_user_analysis',
-      'message_trace_analysis',
-      'device_analysis',
-      'comprehensive_analysis'
-    ]).withMessage('Invalid analysis type'),
+    body('type').isIn(analysisTypes).withMessage('Invalid analysis type'),
     body('priority').optional().isIn(['low', 'medium', 'high', 'critical']).withMessage('Invalid priority'),
     body('parameters').optional().isObject().withMessage('Parameters must be an object')
   ],
@@ -140,8 +132,8 @@ router.post('/internal/direct',
       const { id, extractionId, organizationId, type, priority = 'medium', parameters = {} } = req.body;
 
       // Create analysis job record with specific ID
-      const { execute } = require('../services/database');
-      await execute(
+      const { query } = require('../services/database');
+      await query(
         `INSERT INTO maes.analysis_jobs (id, extraction_id, organization_id, type, priority, parameters, status, created_at, updated_at) 
          VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())`,
         [id, extractionId, organizationId, type, priority, JSON.stringify({...parameters, autoTriggered: true}), 'pending']
@@ -358,8 +350,15 @@ router.get('/:id', async (req, res) => {
       });
     }
 
-    // Get the associated extraction to verify organization access
-    const extraction = await Extraction.findById(analysisJob.extraction_id, req.organizationId);
+    // Verify the user has access to this analysis job's organization
+    if (analysisJob.organization_id !== req.organizationId) {
+      return res.status(404).json({
+        error: 'Analysis job not found'
+      });
+    }
+
+    // Get the associated extraction using the job's organization ID
+    const extraction = await Extraction.findById(analysisJob.extraction_id, analysisJob.organization_id);
     if (!extraction) {
       return res.status(404).json({
         error: 'Analysis job not found'
@@ -384,18 +383,7 @@ router.post('/',
   requirePermission('canRunAnalysis'),
   [
     body('extractionId').isUUID().withMessage('Valid extraction ID is required'),
-    body('type').isIn([
-      'ual_analysis',
-      'signin_analysis',
-      'audit_analysis',
-      'mfa_analysis',
-      'oauth_analysis',
-      'risky_detection_analysis',
-      'risky_user_analysis',
-      'message_trace_analysis',
-      'device_analysis',
-      'comprehensive_analysis'
-    ]).withMessage('Invalid analysis type'),
+    body('type').isIn(analysisTypes).withMessage('Invalid analysis type'),
     body('priority').optional().isIn(['low', 'medium', 'high', 'critical']).withMessage('Invalid priority'),
     body('parameters').optional().isObject().withMessage('Parameters must be an object')
   ],
@@ -423,6 +411,19 @@ router.post('/',
       if (extraction.status !== 'completed') {
         return res.status(400).json({
           error: 'Cannot analyze incomplete extraction'
+        });
+      }
+
+      if (!isAnalyzableExtraction(extraction.type)) {
+        return res.status(400).json({
+          error: `Extraction type '${extraction.type}' does not support analysis`
+        });
+      }
+
+      const recommendedAnalysisType = getAutoAnalysisType(extraction.type);
+      if (recommendedAnalysisType !== type) {
+        return res.status(400).json({
+          error: `Extraction type '${extraction.type}' must use analysis type '${recommendedAnalysisType}'`
         });
       }
 
@@ -470,19 +471,38 @@ router.post('/',
 // Get analysis results
 router.get('/:id/results', async (req, res) => {
   try {
+    logger.info(`Fetching analysis results for ID: ${req.params.id}, Organization: ${req.organizationId}`);
+    
     const analysisJob = await AnalysisJob.findById(req.params.id);
 
     if (!analysisJob) {
+      logger.warn(`Analysis job not found: ${req.params.id}`);
       return res.status(404).json({
-        error: 'Analysis job not found'
+        error: 'Analysis job not found',
+        details: `No analysis job found with ID: ${req.params.id}`
       });
     }
 
-    // Get the associated extraction to verify organization access
-    const extraction = await Extraction.findById(analysisJob.extraction_id, req.organizationId);
-    if (!extraction) {
+    logger.info(`Found analysis job: ${req.params.id}, extraction_id: ${analysisJob.extraction_id}, job_org: ${analysisJob.organization_id}`);
+
+    // Verify the user has access to this analysis job's organization
+    if (analysisJob.organization_id !== req.organizationId) {
+      logger.warn(`Access denied - organization mismatch. Job Org: ${analysisJob.organization_id}, Requested Org: ${req.organizationId}`);
       return res.status(404).json({
-        error: 'Analysis job not found'
+        error: 'Analysis job not found',
+        details: 'Access denied - wrong organization'
+      });
+    }
+
+    // Get the associated extraction using the job's organization ID
+    const extraction = await Extraction.findById(analysisJob.extraction_id, analysisJob.organization_id);
+    logger.info(`Extraction lookup result: ${extraction ? 'found' : 'not found'}, looking for extraction_id: ${analysisJob.extraction_id}, with org_id: ${analysisJob.organization_id}`);
+    
+    if (!extraction) {
+      logger.warn(`Extraction not found. Extraction: ${analysisJob.extraction_id}, Job Org: ${analysisJob.organization_id}`);
+      return res.status(404).json({
+        error: 'Analysis job not found', 
+        details: 'Associated extraction not found'
       });
     }
 
@@ -512,19 +532,36 @@ router.post('/:id/cancel',
   requirePermission('canRunAnalysis'),
   async (req, res) => {
     try {
+      logger.info(`Canceling analysis job: ${req.params.id}, Organization: ${req.organizationId}`);
+      
       const analysisJob = await AnalysisJob.findById(req.params.id);
 
       if (!analysisJob) {
+        logger.warn(`Analysis job not found for cancel: ${req.params.id}`);
         return res.status(404).json({
-          error: 'Analysis job not found'
+          error: 'Analysis job not found',
+          details: `No analysis job found with ID: ${req.params.id}`
         });
       }
 
-      // Get the associated extraction to verify organization access
-      const extraction = await Extraction.findById(analysisJob.extraction_id, req.organizationId);
-      if (!extraction) {
+      logger.info(`Found analysis job to cancel: ${req.params.id}, extraction_id: ${analysisJob.extraction_id}, job_org: ${analysisJob.organization_id}`);
+
+      // Verify the user has access to this analysis job's organization
+      if (analysisJob.organization_id !== req.organizationId) {
+        logger.warn(`Access denied for cancel - organization mismatch. Job Org: ${analysisJob.organization_id}, Requested Org: ${req.organizationId}`);
         return res.status(404).json({
-          error: 'Analysis job not found'
+          error: 'Analysis job not found',
+          details: 'Access denied - wrong organization'
+        });
+      }
+
+      // Get the associated extraction using the job's organization ID
+      const extraction = await Extraction.findById(analysisJob.extraction_id, analysisJob.organization_id);
+      if (!extraction) {
+        logger.warn(`Extraction not found for cancel. Extraction: ${analysisJob.extraction_id}, Job Org: ${analysisJob.organization_id}`);
+        return res.status(404).json({
+          error: 'Analysis job not found',
+          details: 'Associated extraction not found'
         });
       }
 

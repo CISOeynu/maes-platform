@@ -368,10 +368,28 @@ if (!isMainThread && workerData.type === 'job_processor') {
     // Analyze each audit log entry
     for (const event of auditData) {
       // Extract user and operation info - support both formats
-      const user = event.UserId || event.UserPrincipalName || 
-                   event.initiatedBy?.user?.userPrincipalName || 
-                   event.initiatedBy?.user?.displayName || 
-                   'Unknown';
+      let user = event.UserId || event.UserPrincipalName || 
+                 event.initiatedBy?.user?.userPrincipalName || 
+                 event.initiatedBy?.user?.displayName || 
+                 event.Actor?.ID ||
+                 event.Actor?.Name ||
+                 event.User ||
+                 null;
+      
+      // Create unique identifier for unknown users
+      if (!user || user === '' || user.toLowerCase() === 'unknown') {
+        const sessionId = event.SessionId || event.CorrelationId || '';
+        const ip = event.ClientIP || event.IPAddress || event.initiatedBy?.user?.ipAddress || '';
+        const timestamp = new Date(event.CreationTime || event.TimeGenerated || event.activityDateTime || Date.now());
+        
+        if (sessionId) {
+          user = `Unknown_Session_${sessionId.substring(0, 8)}`;
+        } else if (ip && ip !== 'Unknown') {
+          user = `Unknown_IP_${ip.replace(/\./g, '_')}`;
+        } else {
+          user = `Unknown_${timestamp.getTime()}_${Math.random().toString(36).substring(2, 7)}`;
+        }
+      }
       const operation = event.Operation || event.activityDisplayName || 'Unknown';
       const result = event.ResultStatus || event.result || 'Success';
       const timestamp = new Date(event.CreationTime || event.TimeGenerated || event.activityDateTime);
@@ -499,9 +517,28 @@ if (!isMainThread && workerData.type === 'job_processor') {
       // Check for multiple failed operations
       if (result !== 'Success' && result !== 'success') {
         const recentFailures = auditData.filter(e => {
-          const eventUser = e.UserId || e.UserPrincipalName || 
-                           e.initiatedBy?.user?.userPrincipalName || 
-                           e.initiatedBy?.user?.displayName || 'Unknown';
+          let eventUser = e.UserId || e.UserPrincipalName || 
+                         e.initiatedBy?.user?.userPrincipalName || 
+                         e.initiatedBy?.user?.displayName || 
+                         e.Actor?.ID ||
+                         e.Actor?.Name ||
+                         e.User ||
+                         null;
+          
+          // Apply same unknown user logic
+          if (!eventUser || eventUser === '' || eventUser.toLowerCase() === 'unknown') {
+            const sessionId = e.SessionId || e.CorrelationId || '';
+            const ip = e.ClientIP || e.IPAddress || e.initiatedBy?.user?.ipAddress || '';
+            const eTimestamp = new Date(e.CreationTime || e.TimeGenerated || e.activityDateTime || Date.now());
+            
+            if (sessionId) {
+              eventUser = `Unknown_Session_${sessionId.substring(0, 8)}`;
+            } else if (ip && ip !== 'Unknown') {
+              eventUser = `Unknown_IP_${ip.replace(/\./g, '_')}`;
+            } else {
+              eventUser = `Unknown_${eTimestamp.getTime()}_${Math.random().toString(36).substring(2, 7)}`;
+            }
+          }
           const eventResult = e.ResultStatus || e.result || 'Success';
           const eventTime = new Date(e.CreationTime || e.TimeGenerated || e.activityDateTime);
           
@@ -828,7 +865,8 @@ if (!isMainThread && workerData.type === 'job_processor') {
       try {
         const uploadResponse = await axios.get(`http://api:3000/api/upload/data/${extractionId}`, {
           headers: {
-            'x-service-token': process.env.SERVICE_AUTH_TOKEN
+            'x-service-token': process.env.SERVICE_AUTH_TOKEN,
+            'x-organization-id': organizationId
           },
           timeout: 30000
         });
@@ -845,18 +883,24 @@ if (!isMainThread && workerData.type === 'job_processor') {
         const path = require('path');
         const csvParser = require('csv-parser');
         
-        // Check common output directories
+        // Check common output directories (including organization-scoped paths)
+        const safeOrgId = (organizationId || 'default').replace(/[^a-zA-Z0-9-]/g, '');
         const possiblePaths = [
-          `/output/${extractionId}`,
-          `/extractor_output/${extractionId}`,
-          `/app/output/${extractionId}`,
-          `/shared/output/${extractionId}`
+          `/output/orgs/${safeOrgId}/${extractionId}`, // Organization-scoped path (primary)
+          `/output/${extractionId}`, // Legacy path for backward compatibility
+          `/extractor_output/orgs/${safeOrgId}/${extractionId}`, // Organization-scoped alternative
+          `/extractor_output/${extractionId}`, // Legacy alternative
+          `/app/output/orgs/${safeOrgId}/${extractionId}`, // Docker mounted org-scoped
+          `/app/output/${extractionId}`, // Docker mounted legacy
+          `/shared/output/orgs/${safeOrgId}/${extractionId}`, // Shared volume org-scoped
+          `/shared/output/${extractionId}` // Shared volume legacy
         ];
         
         let dataFound = false;
         
         // Log all paths being checked
-        logger.info(`Looking for extraction data in paths: ${possiblePaths.join(', ')}`);
+        logger.info(`Looking for extraction data for organization ${organizationId} (safe: ${safeOrgId}), extraction ${extractionId}`);
+        logger.info(`Checking paths: ${possiblePaths.join(', ')}`);
         
         for (const basePath of possiblePaths) {
           logger.info(`Checking path: ${basePath}`);
@@ -910,20 +954,85 @@ if (!isMainThread && workerData.type === 'job_processor') {
         }
       }
       
-      logger.info(`Loaded ${auditData.length} audit log entries for analysis`);
+      // Use appropriate label based on analysis type
+      const dataTypeLabel = {
+        'device_analysis': 'device records',
+        'mfa_analysis': 'MFA status records', 
+        'risky_user_analysis': 'user records',
+        'comprehensive_analysis': 'records',
+        'ual_analysis': 'audit log entries',
+        'signin_analysis': 'sign-in log entries',
+        'audit_analysis': 'audit log entries',
+        'oauth_analysis': 'OAuth permission records',
+        'risky_detection_analysis': 'risky detection records'
+      };
+      const dataLabel = dataTypeLabel[data.analysisType] || 'data records';
+      logger.info(`Loaded ${auditData.length} ${dataLabel} for analysis`);
       
       parentPort.postMessage({
         type: 'job_progress',
         jobId: jobId,
-        data: { progress: 40, message: 'Analyzing audit logs' }
+        data: { progress: 40, message: `Analyzing ${dataLabel}` }
       });
 
-      // Analyze the audit data using the enhanced analyzer
-      const analysisResult = await EnhancedAnalyzer.analyzeEntraAuditLogs(auditData, {
-        analysisId,
-        extractionId,
-        organizationId: organizationId || '00000000-0000-0000-0000-000000000001'
-      });
+      // Analyze the data using the appropriate analyzer based on analysis type
+      let analysisResult;
+      
+      // Determine which analyzer to use based on the analysis type
+      switch (data.analysisType || 'ual_analysis') {
+        case 'ual_analysis':
+        case 'signin_analysis':
+        case 'audit_analysis':
+        case 'oauth_analysis':
+        case 'risky_detection_analysis':
+        case 'message_trace_analysis':
+          analysisResult = await EnhancedAnalyzer.analyzeEntraAuditLogs(auditData, {
+            analysisId,
+            extractionId,
+            organizationId: organizationId || '00000000-0000-0000-0000-000000000001'
+          });
+          break;
+        case 'mfa_analysis':
+          analysisResult = await EnhancedAnalyzer.analyzeMfaData(auditData, {
+            analysisId,
+            extractionId,
+            organizationId: organizationId || '00000000-0000-0000-0000-000000000001'
+          });
+          break;
+        case 'device_analysis':
+          analysisResult = await EnhancedAnalyzer.analyzeDeviceData(auditData, {
+            analysisId,
+            extractionId,
+            organizationId: organizationId || '00000000-0000-0000-0000-000000000001'
+          });
+          break;
+        case 'risky_user_analysis':
+          analysisResult = await EnhancedAnalyzer.analyzeUserData(auditData, {
+            analysisId,
+            extractionId,
+            organizationId: organizationId || '00000000-0000-0000-0000-000000000001'
+          });
+          break;
+        case 'comprehensive_analysis':
+          // For comprehensive analysis, check if this is license data
+          if (auditData.length > 0 && (auditData[0].skuPartNumber || auditData[0].SkuPartNumber)) {
+            analysisResult = await EnhancedAnalyzer.analyzeLicenseData(auditData, {
+              analysisId,
+              extractionId,
+              organizationId: organizationId || '00000000-0000-0000-0000-000000000001'
+            });
+          } else {
+            // Default to audit log analysis for comprehensive analysis
+            analysisResult = await EnhancedAnalyzer.analyzeEntraAuditLogs(auditData, {
+              analysisId,
+              extractionId,
+              organizationId: organizationId || '00000000-0000-0000-0000-000000000001'
+            });
+          }
+          break;
+        default:
+          throw new Error(`Unsupported analysis type: ${data.analysisType}`);
+      }
       
       parentPort.postMessage({
         type: 'job_progress',

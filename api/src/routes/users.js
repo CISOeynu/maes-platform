@@ -1,46 +1,132 @@
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const { User, Organization, AuditLog } = require('../services/models');
-const { authenticateToken, requirePermission, requireOrganizationAccess } = require('../middleware/auth');
+const { authenticateToken, requirePermission, requireSuperAdmin } = require('../middleware/auth');
 const { logger } = require('../utils/logger');
+const { pool } = require('../services/database');
 
 const router = express.Router();
 
+// Get all organizations (for super admin user management)
+router.get('/organizations/all', authenticateToken, requireSuperAdmin(), async (req, res) => {
+  try {
+    const organizationsQuery = `
+      SELECT id, name, organization_type, is_active, created_at
+      FROM maes.organizations
+      ORDER BY name ASC
+    `;
+    
+    const result = await pool.query(organizationsQuery);
+    
+    res.json({
+      success: true,
+      organizations: result.rows.map(org => ({
+        id: org.id,
+        name: org.name,
+        organizationType: org.organization_type,
+        isActive: org.is_active,
+        createdAt: org.created_at
+      }))
+    });
+  } catch (error) {
+    logger.error('Get all organizations error:', error);
+    res.status(500).json({ error: 'Failed to retrieve organizations' });
+  }
+});
+
 // Get users for organization
 router.get('/', authenticateToken, requirePermission('canManageUsers'), async (req, res) => {
+  
   try {
-    const { page = 1, limit = 20, role, search, isActive } = req.query;
+    const { page = 1, limit = 20, role, search, isActive, allOrganizations } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
 
-    const whereClause = { organizationId: req.organizationId };
+    let whereConditions = [];
+    let queryParams = [];
+    let paramCount = 0;
 
-    if (role) whereClause.role = role;
-    if (isActive !== undefined) whereClause.isActive = isActive === 'true';
-
-    if (search) {
-      whereClause[sequelize.Op.or] = [
-        { firstName: { [sequelize.Op.iLike]: `%${search}%` } },
-        { lastName: { [sequelize.Op.iLike]: `%${search}%` } },
-        { email: { [sequelize.Op.iLike]: `%${search}%` } },
-        { username: { [sequelize.Op.iLike]: `%${search}%` } }
-      ];
+    // Super admins can see users from all organizations if requested
+    const isSuperAdmin = req.user.role === 'admin' || req.user.role === 'super_admin';
+    
+    if (!allOrganizations || !isSuperAdmin) {
+      // Regular filter by organization
+      paramCount++;
+      whereConditions.push(`u.organization_id = $${paramCount}`);
+      queryParams.push(req.organizationId);
     }
 
-    const users = await User.findAndCountAll({
-      where: whereClause,
-      limit: parseInt(limit),
-      offset: (parseInt(page) - 1) * parseInt(limit),
-      order: [['createdAt', 'DESC']]
-    });
+    if (role) {
+      paramCount++;
+      whereConditions.push(`u.role = $${paramCount}`);
+      queryParams.push(role);
+    }
+
+    if (isActive !== undefined) {
+      paramCount++;
+      whereConditions.push(`u.is_active = $${paramCount}`);
+      queryParams.push(isActive === 'true');
+    }
+
+    if (search) {
+      paramCount++;
+      whereConditions.push(`(
+        u.first_name ILIKE $${paramCount} OR 
+        u.last_name ILIKE $${paramCount} OR 
+        u.email ILIKE $${paramCount} OR 
+        u.username ILIKE $${paramCount}
+      )`);
+      queryParams.push(`%${search}%`);
+    }
+
+    const whereClause = whereConditions.length > 0 ? whereConditions.join(' AND ') : '1=1';
+
+    // Get total count
+    const countQuery = `
+      SELECT COUNT(*) as total 
+      FROM maes.users u 
+      ${whereConditions.length > 0 ? `WHERE ${whereClause}` : ''}
+    `;
+    const countResult = await pool.query(countQuery, queryParams);
+    const total = parseInt(countResult.rows[0].total);
+
+    // Get paginated users with organization info for super admins
+    paramCount++;
+    const usersQuery = `
+      SELECT 
+        u.id, u.email, u.username, u.first_name, u.last_name,
+        u.role, u.permissions, u.is_active, u.last_login,
+        u.created_at, u.updated_at, u.organization_id,
+        o.name as organization_name, o.organization_type
+      FROM maes.users u
+      LEFT JOIN maes.organizations o ON u.organization_id = o.id
+      ${whereConditions.length > 0 ? `WHERE ${whereClause}` : ''}
+      ORDER BY u.created_at DESC
+      LIMIT $${paramCount} OFFSET $${paramCount + 1}
+    `;
+    queryParams.push(parseInt(limit), offset);
+    
+    const usersResult = await pool.query(usersQuery, queryParams);
 
     res.json({
       success: true,
-      users: users.rows,
+      users: usersResult.rows.map(user => ({
+        ...user,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        isActive: user.is_active,
+        lastLoginAt: user.last_login,
+        createdAt: user.created_at,
+        organizationId: user.organization_id,
+        organizationName: user.organization_name,
+        organizationType: user.organization_type
+      })),
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total: users.count,
-        pages: Math.ceil(users.count / parseInt(limit))
-      }
+        total: total,
+        totalPages: Math.ceil(total / parseInt(limit))
+      },
+      isSuperAdminView: allOrganizations && isSuperAdmin
     });
 
   } catch (error) {
@@ -90,6 +176,7 @@ router.post('/', authenticateToken, requirePermission('canManageUsers'), async (
       firstName,
       lastName,
       role,
+      organizationId: targetOrgId,
       specialization = [],
       accessibleOrganizations = []
     } = req.body;
@@ -99,46 +186,69 @@ router.post('/', authenticateToken, requirePermission('canManageUsers'), async (
       return res.status(400).json({ error: 'Email, username, password, and role are required' });
     }
 
-    // Check if user already exists
-    const existingUser = await User.findOne({
-      where: {
-        [sequelize.Op.or]: [{ email }, { username }]
-      }
-    });
+    // Determine target organization
+    const isSuperAdmin = req.user.role === 'admin' || req.user.role === 'super_admin';
+    const finalOrgId = (isSuperAdmin && targetOrgId) ? targetOrgId : req.organizationId;
 
-    if (existingUser) {
+    // Check if user already exists
+    const existingUserQuery = `
+      SELECT id FROM maes.users 
+      WHERE email = $1 OR username = $2
+    `;
+    const existingUser = await pool.query(existingUserQuery, [email, username]);
+
+    if (existingUser.rows.length > 0) {
       return res.status(400).json({ error: 'User with this email or username already exists' });
     }
 
-    // Validate role based on organization type
-    const organization = await Organization.findByPk(req.organizationId);
-    const validRoles = {
-      mssp: ['mssp_admin', 'mssp_analyst', 'mssp_responder'],
-      client: ['client_admin', 'client_analyst', 'client_viewer'],
-      standalone: ['standalone_admin', 'standalone_analyst', 'standalone_viewer']
-    };
+    // Get target organization
+    const orgQuery = `
+      SELECT id, name, organization_type 
+      FROM maes.organizations 
+      WHERE id = $1
+    `;
+    const orgResult = await pool.query(orgQuery, [finalOrgId]);
+    
+    if (orgResult.rows.length === 0) {
+      return res.status(400).json({ error: 'Organization not found' });
+    }
+    
+    const organization = orgResult.rows[0];
 
-    if (!validRoles[organization.organizationType].includes(role)) {
-      return res.status(400).json({ error: `Invalid role for ${organization.organizationType} organization` });
+    // For super admins, allow all roles; otherwise validate based on organization type
+    if (!isSuperAdmin) {
+      const validRoles = {
+        mssp: ['mssp_admin', 'mssp_analyst', 'mssp_responder'],
+        client: ['client_admin', 'client_analyst', 'client_viewer'],
+        standalone: ['standalone_admin', 'standalone_analyst', 'standalone_viewer']
+      };
+
+      if (!validRoles[organization.organization_type]?.includes(role)) {
+        return res.status(400).json({ error: `Invalid role for ${organization.organization_type} organization` });
+      }
     }
 
-    // Create user
-    const user = await User.create({
-      email,
-      username,
-      password,
-      firstName,
-      lastName,
-      role,
-      organizationId: req.organizationId,
-      msspId: req.msspId,
-      userType: organization.organizationType === 'client' ? 'client' : 
-                organization.organizationType === 'mssp' ? 'mssp' : 'standalone',
-      specialization,
-      accessibleOrganizations
-    });
+    // Hash password
+    const hashedPassword = await bcrypt.hash(password, 12);
 
-    logger.info(`Created user: ${user.id} (${role}) in organization: ${req.organizationId}`);
+    // Create user
+    const createUserQuery = `
+      INSERT INTO maes.users (
+        id, email, username, password, first_name, last_name,
+        role, organization_id, is_active, created_at, updated_at
+      ) VALUES (
+        gen_random_uuid(), $1, $2, $3, $4, $5, $6, $7, true, NOW(), NOW()
+      )
+      RETURNING id, email, username, first_name, last_name, role, organization_id, is_active, created_at
+    `;
+    
+    const userResult = await pool.query(createUserQuery, [
+      email, username, hashedPassword, firstName, lastName, role, finalOrgId
+    ]);
+    
+    const user = userResult.rows[0];
+
+    logger.info(`Created user: ${user.id} (${role}) in organization: ${finalOrgId}`);
 
     res.status(201).json({
       success: true,
@@ -146,11 +256,12 @@ router.post('/', authenticateToken, requirePermission('canManageUsers'), async (
         id: user.id,
         email: user.email,
         username: user.username,
-        firstName: user.firstName,
-        lastName: user.lastName,
+        firstName: user.first_name,
+        lastName: user.last_name,
         role: user.role,
-        userType: user.userType,
-        organizationId: user.organizationId
+        organizationId: user.organization_id,
+        isActive: user.is_active,
+        createdAt: user.created_at
       }
     });
 
@@ -174,12 +285,16 @@ router.put('/:userId', authenticateToken, requirePermission('canManageUsers'), a
       preferences
     } = req.body;
 
-    const user = await User.findOne({
-      where: { id: userId, organizationId: req.organizationId }
-    });
+    // Find the user first
+    const user = await User.findById(userId);
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check organization access
+    if (user.organization_id !== req.organizationId && req.user.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Access denied to this user' });
     }
 
     // Update user
@@ -192,7 +307,11 @@ router.put('/:userId', authenticateToken, requirePermission('canManageUsers'), a
     if (isActive !== undefined) updateData.isActive = isActive;
     if (preferences !== undefined) updateData.preferences = preferences;
 
-    await user.update(updateData);
+    const updatedUser = await User.update(userId, updateData);
+
+    if (!updatedUser) {
+      return res.status(500).json({ error: 'Failed to update user - no valid fields provided' });
+    }
 
     logger.info(`Updated user: ${userId}`);
 
@@ -200,19 +319,65 @@ router.put('/:userId', authenticateToken, requirePermission('canManageUsers'), a
       success: true,
       message: 'User updated successfully',
       user: {
-        id: user.id,
-        email: user.email,
-        username: user.username,
-        firstName: user.firstName,
-        lastName: user.lastName,
-        role: user.role,
-        isActive: user.isActive
+        id: updatedUser.id,
+        email: updatedUser.email,
+        username: updatedUser.username,
+        firstName: updatedUser.first_name,
+        lastName: updatedUser.last_name,
+        role: updatedUser.role,
+        isActive: updatedUser.is_active,
+        permissions: updatedUser.permissions
       }
     });
 
   } catch (error) {
     logger.error('Update user error:', error);
     res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+// Update user permissions
+router.patch('/:userId/permissions', authenticateToken, requirePermission('canManageUsers'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { permissions } = req.body;
+
+    if (!permissions || typeof permissions !== 'object') {
+      return res.status(400).json({ error: 'Valid permissions object is required' });
+    }
+
+    // Find the user first
+    const user = await User.findById(userId);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check organization access
+    if (user.organization_id !== req.organizationId && req.user.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Access denied to this user' });
+    }
+
+    // Update user permissions
+    const updatedUser = await User.update(userId, { permissions });
+
+    if (!updatedUser) {
+      return res.status(500).json({ error: 'Failed to update user permissions' });
+    }
+
+    logger.info(`Updated permissions for user: ${userId}`);
+
+    res.json({
+      success: true,
+      message: 'User permissions updated successfully',
+      permissions: typeof updatedUser.permissions === 'string' 
+        ? JSON.parse(updatedUser.permissions) 
+        : updatedUser.permissions
+    });
+
+  } catch (error) {
+    logger.error('Update user permissions error:', error);
+    res.status(500).json({ error: 'Failed to update user permissions' });
   }
 });
 
@@ -226,17 +391,30 @@ router.patch('/:userId/password', authenticateToken, requirePermission('canManag
       return res.status(400).json({ error: 'New password is required' });
     }
 
-    const user = await User.findOne({
-      where: { id: userId, organizationId: req.organizationId }
-    });
-
-    if (!user) {
+    // Verify user exists and belongs to the organization
+    const checkUserQuery = `
+      SELECT id, email, username 
+      FROM maes.users 
+      WHERE id = $1 AND organization_id = $2
+    `;
+    
+    const userResult = await pool.query(checkUserQuery, [userId, req.organizationId]);
+    
+    if (userResult.rows.length === 0) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    // Update password
-    user.password = newPassword;
-    await user.save();
+    // Hash the new password
+    const hashedPassword = await bcrypt.hash(newPassword, 12);
+
+    // Update password in database
+    const updateQuery = `
+      UPDATE maes.users 
+      SET password = $1, updated_at = NOW() 
+      WHERE id = $2
+    `;
+    
+    await pool.query(updateQuery, [hashedPassword, userId]);
 
     logger.info(`Changed password for user: ${userId}`);
 
@@ -285,6 +463,51 @@ router.patch('/:userId/deactivate', authenticateToken, requirePermission('canMan
 });
 
 // Reactivate user
+router.patch('/:userId/permissions', authenticateToken, requirePermission('canManageUsers'), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { permissions } = req.body;
+
+    // Validate permissions object
+    if (!permissions || typeof permissions !== 'object') {
+      return res.status(400).json({ error: 'Invalid permissions object' });
+    }
+
+    const user = await User.findById(userId);
+
+    if (!user || user.organization_id !== req.organizationId) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Don't allow users to modify their own permissions unless they are super admin
+    const isSuperAdmin = req.user.role === 'admin' || req.user.role === 'super_admin';
+    if (userId === req.user.id && !isSuperAdmin) {
+      return res.status(403).json({ error: 'Cannot modify your own permissions' });
+    }
+
+    // Update user permissions
+    const updatedUser = await User.update(userId, { permissions });
+
+    logger.info(`Updated permissions for user: ${userId}`);
+
+    res.json({
+      success: true,
+      message: 'User permissions updated successfully',
+      user: {
+        id: updatedUser.id,
+        email: updatedUser.email,
+        username: updatedUser.username,
+        role: updatedUser.role,
+        permissions: updatedUser.permissions
+      }
+    });
+
+  } catch (error) {
+    logger.error('Update user permissions error:', error);
+    res.status(500).json({ error: 'Failed to update user permissions' });
+  }
+});
+
 router.patch('/:userId/reactivate', authenticateToken, requirePermission('canManageUsers'), async (req, res) => {
   try {
     const { userId } = req.params;
@@ -309,6 +532,59 @@ router.patch('/:userId/reactivate', authenticateToken, requirePermission('canMan
   } catch (error) {
     logger.error('Reactivate user error:', error);
     res.status(500).json({ error: 'Failed to reactivate user' });
+  }
+});
+
+// Update user organization access
+router.patch('/:userId/organization-access', authenticateToken, requireSuperAdmin(), async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { accessibleOrganizations } = req.body;
+
+    // Validate accessibleOrganizations is an array
+    if (!Array.isArray(accessibleOrganizations)) {
+      return res.status(400).json({ error: 'accessibleOrganizations must be an array' });
+    }
+
+    const user = await User.findById(userId);
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Verify all organizations exist
+    for (const orgId of accessibleOrganizations) {
+      const orgQuery = `SELECT id FROM maes.organizations WHERE id = $1`;
+      const orgResult = await pool.query(orgQuery, [orgId]);
+      if (orgResult.rows.length === 0) {
+        return res.status(400).json({ error: `Organization ${orgId} not found` });
+      }
+    }
+
+    // Clear existing organization access
+    const deleteQuery = `DELETE FROM maes.user_organizations WHERE user_id = $1`;
+    await pool.query(deleteQuery, [userId]);
+
+    // Add new organization access
+    for (const orgId of accessibleOrganizations) {
+      const insertQuery = `
+        INSERT INTO maes.user_organizations (id, user_id, organization_id, role, created_at, updated_at)
+        VALUES (gen_random_uuid(), $1, $2, 'viewer', NOW(), NOW())
+        ON CONFLICT (user_id, organization_id) DO NOTHING
+      `;
+      await pool.query(insertQuery, [userId, orgId]);
+    }
+
+    logger.info(`Updated organization access for user: ${userId}`);
+
+    res.json({
+      success: true,
+      message: 'Organization access updated successfully'
+    });
+
+  } catch (error) {
+    logger.error('Update organization access error:', error);
+    res.status(500).json({ error: 'Failed to update organization access' });
   }
 });
 

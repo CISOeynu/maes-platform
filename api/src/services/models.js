@@ -54,15 +54,39 @@ const UserModel = {
 
   // Update user
   update: async (id, updates) => {
+    // Whitelist of allowed fields to prevent SQL injection
+    const allowedFields = [
+      'username', 'email', 'firstName', 'lastName', 'phone', 'organization',
+      'department', 'jobTitle', 'location', 'bio', 'profilePicture', 
+      'preferences', 'isActive', 'organizationId', 'role', 'permissions'
+    ];
+    
     const fields = [];
     const values = [];
     let paramCount = 1;
 
     Object.keys(updates).forEach(key => {
       if (key !== 'id') {
-        fields.push(`${key.replace(/([A-Z])/g, '_$1').toLowerCase()} = $${paramCount}`);
-        values.push(updates[key]);
-        paramCount++;
+        // Convert camelCase to snake_case and validate against whitelist
+        const dbField = key.replace(/([A-Z])/g, '_$1').toLowerCase();
+        const camelField = key;
+        
+        // Check if field is allowed (either camelCase or snake_case)
+        if (allowedFields.includes(camelField) || allowedFields.includes(dbField)) {
+          fields.push(`${dbField} = $${paramCount}`);
+          
+          // Handle JSON fields properly
+          let value = updates[key];
+          if ((key === 'permissions' || key === 'preferences') && typeof value === 'object') {
+            value = JSON.stringify(value);
+          }
+          
+          values.push(value);
+          paramCount++;
+        } else {
+          // Log potential SQL injection attempt
+          console.warn(`Blocked potential SQL injection attempt: field '${key}' not in whitelist`);
+        }
       }
     });
 
@@ -148,6 +172,74 @@ const OrganizationModel = {
     ]);
   },
 
+  // Check if organization is properly configured for extractions
+  isConfiguredForExtractions: (organization) => {
+    if (!organization) return false;
+    if (!organization.is_active) return false;
+    if (!organization.tenant_id) return false;
+    
+    const credentials = organization.credentials || {};
+    
+    // Must have applicationId
+    if (!credentials.applicationId) return false;
+    
+    // Must have either certificateThumbprint OR clientSecret for authentication
+    // Note: clientSecret can be "0" which is falsy but valid
+    const hasCertAuth = credentials.certificateThumbprint;
+    const hasSecretAuth = credentials.clientSecret !== undefined && credentials.clientSecret !== null;
+    
+    if (!hasCertAuth && !hasSecretAuth) return false;
+    
+    return true;
+  },
+
+  // Get configuration status with detailed information
+  getConfigurationStatus: (organization) => {
+    if (!organization) {
+      return {
+        isConfigured: false,
+        missingRequirements: ['Organization not found'],
+        canRunExtractions: false
+      };
+    }
+
+    const missingRequirements = [];
+    
+    if (!organization.is_active) {
+      missingRequirements.push('Organization is inactive');
+    }
+    
+    if (!organization.tenant_id) {
+      missingRequirements.push('Tenant ID not configured');
+    }
+    
+    if (!organization.fqdn) {
+      missingRequirements.push('Organization domain (FQDN) not configured');
+    }
+    
+    const credentials = organization.credentials || {};
+    
+    // Check for applicationId (always required)
+    if (!credentials.applicationId) {
+      missingRequirements.push('Missing credential: applicationId');
+    }
+    
+    // Check for authentication method (need either certificate or client secret)
+    // Note: clientSecret can be "0" which is falsy but valid
+    const hasCertAuth = credentials.certificateThumbprint;
+    const hasSecretAuth = credentials.clientSecret !== undefined && credentials.clientSecret !== null;
+    
+    if (!hasCertAuth && !hasSecretAuth) {
+      missingRequirements.push('Missing authentication method: need either certificateThumbprint or clientSecret');
+    }
+
+    return {
+      isConfigured: missingRequirements.length === 0,
+      missingRequirements,
+      canRunExtractions: missingRequirements.length === 0
+    };
+  },
+
   update: async (id, updates) => {
     const fields = [];
     const values = [];
@@ -155,7 +247,7 @@ const OrganizationModel = {
 
     // Map camelCase to snake_case for database columns
     const fieldMapping = {
-      organizationName: 'name',
+      name: 'name',
       tenantId: 'tenant_id',
       fqdn: 'fqdn',
       subscriptionId: 'subscription_id',
@@ -194,11 +286,28 @@ const OrganizationModel = {
     `;
     
     logger.info('Organization update query:', { query, values });
-    return await update(query, values);
+    
+    try {
+      return await update(query, values);
+    } catch (error) {
+      // Handle unique constraint violations
+      if (error.code === '23505') { // PostgreSQL unique violation error code
+        if (error.constraint === 'organizations_tenant_id_key') {
+          throw new Error('Tenant ID already exists for another organization');
+        }
+        throw new Error('Duplicate value: ' + error.detail);
+      }
+      throw error;
+    }
   },
 
   findByPk: async (id) => {
     return await getRow('SELECT * FROM maes.organizations WHERE id = $1', [id]);
+  },
+  
+  delete: async (id) => {
+    const query = 'DELETE FROM maes.organizations WHERE id = $1 RETURNING *';
+    return await remove(query, [id]);
   },
 
   count: async (conditions = {}) => {
@@ -335,6 +444,32 @@ const ExtractionModel = {
       RETURNING *
     `;
     return await update(query, values);
+  },
+
+  countByOrganization: async (organizationId, filters = {}) => {
+    let whereClause = 'WHERE organization_id = $1';
+    const values = [organizationId];
+    let paramCount = 2;
+
+    if (filters.status) {
+      if (Array.isArray(filters.status)) {
+        const statusPlaceholders = filters.status.map((_, i) => `$${paramCount + i}`).join(', ');
+        whereClause += ` AND status IN (${statusPlaceholders})`;
+        values.push(...filters.status);
+        paramCount += filters.status.length;
+      } else {
+        whereClause += ` AND status = $${paramCount}`;
+        values.push(filters.status);
+        paramCount++;
+      }
+    }
+
+    const query = `
+      SELECT COUNT(*) FROM maes.extractions 
+      ${whereClause}
+    `;
+    
+    return await count(query, values);
   }
 };
 

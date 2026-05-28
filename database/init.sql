@@ -16,20 +16,45 @@ CREATE TYPE extraction_type AS ENUM (
     'unified_audit_log',
     'azure_signin_logs', 
     'azure_audit_logs',
+    'admin_audit_log',
     'mailbox_audit',
     'message_trace',
-    'emails',
     'oauth_permissions',
     'mfa_status',
     'risky_users',
     'risky_detections',
     'devices',
+    'ual_graph',
+    'licenses',
+    'mailbox_rules',
+    'transport_rules',
+    'activity_logs',
+    'directory_activity_logs',
+    'admin_users',
+    'conditional_access_policies',
+    'mailbox_audit_status',
+    'mailbox_permissions',
+    'licenses_by_user',
+    'license_compatibility',
+    'entra_security_defaults',
+    'groups',
+    'group_members',
+    'dynamic_groups',
+    'pim_assignments',
+    'role_activity',
+    'security_alerts',
     'full_extraction'
 );
 CREATE TYPE job_status AS ENUM ('pending', 'running', 'completed', 'failed', 'cancelled');
 CREATE TYPE priority_level AS ENUM ('low', 'medium', 'high', 'critical');
 CREATE TYPE alert_severity AS ENUM ('low', 'medium', 'high', 'critical');
 CREATE TYPE alert_status AS ENUM ('new', 'acknowledged', 'investigating', 'resolved', 'false_positive');
+
+-- Compliance assessment enum types
+CREATE TYPE assessment_type AS ENUM ('cis_v400', 'cis_v300', 'custom', 'orca_style');
+CREATE TYPE control_severity AS ENUM ('level1', 'level2');
+CREATE TYPE compliance_status AS ENUM ('compliant', 'non_compliant', 'manual_review', 'not_applicable', 'error');
+CREATE TYPE schedule_frequency AS ENUM ('daily', 'weekly', 'monthly', 'quarterly');
 
 -- Create tables
 CREATE TABLE IF NOT EXISTS organizations (
@@ -45,6 +70,9 @@ CREATE TABLE IF NOT EXISTS organizations (
     credentials JSONB DEFAULT '{}',
     is_active BOOLEAN DEFAULT true,
     metadata JSONB DEFAULT '{}',
+    offboard_scheduled_at TIMESTAMP WITH TIME ZONE,
+    offboard_reason TEXT,
+    offboard_grace_period_days INTEGER,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
@@ -251,17 +279,218 @@ CREATE TRIGGER update_alerts_updated_at BEFORE UPDATE ON alerts
 CREATE TRIGGER update_reports_updated_at BEFORE UPDATE ON reports
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
--- Insert default admin user (password: admin123 - change in production!)
-INSERT INTO organizations (id, name, tenant_id) VALUES 
-    ('00000000-0000-0000-0000-000000000001', 'MAES Default Organization', 'maes-default-tenant');
+-- Initial users are no longer seeded with default credentials.
+-- Create the first administrator account through the registration flow after deployment.
 
-INSERT INTO users (organization_id, email, username, password, role, permissions) VALUES 
-    ('00000000-0000-0000-0000-000000000001', 
-     'admin@maes.local', 
-     'admin', 
-     '$2a$10$TVQSYBn13hZpQ9O/uXKsTu32UmErtxG3m2FHUDL7DOhBLwUS7l1fm', -- bcrypt hash of 'admin123'
-     'admin',
-     '{"canManageExtractions": true, "canRunAnalysis": true, "canViewReports": true, "canManageAlerts": true, "canManageUsers": true, "canManageOrganization": true}');
+-- Create migrations table for tracking applied migrations
+CREATE TABLE IF NOT EXISTS migrations (
+    id SERIAL PRIMARY KEY,
+    filename VARCHAR(255) UNIQUE NOT NULL,
+    applied_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create user_organizations table for multi-organization support (Migration 004)
+CREATE TABLE IF NOT EXISTS user_organizations (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    organization_id UUID REFERENCES organizations(id) ON DELETE CASCADE,
+    role VARCHAR(50) DEFAULT 'viewer',
+    permissions JSONB DEFAULT '{}',
+    is_primary BOOLEAN DEFAULT false,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, organization_id)
+);
+
+-- Add current_organization_id to users table for active organization context
+ALTER TABLE users ADD COLUMN IF NOT EXISTS current_organization_id UUID REFERENCES organizations(id);
+
+-- Add indexes for user_organizations performance
+CREATE INDEX IF NOT EXISTS idx_user_organizations_user_id ON user_organizations(user_id);
+CREATE INDEX IF NOT EXISTS idx_user_organizations_organization_id ON user_organizations(organization_id);
+CREATE INDEX IF NOT EXISTS idx_user_organizations_primary ON user_organizations(user_id, is_primary) WHERE is_primary = true;
+CREATE INDEX IF NOT EXISTS idx_users_current_organization ON users(current_organization_id);
+
+-- Create trigger for user_organizations updated_at
+CREATE TRIGGER update_user_organizations_updated_at 
+    BEFORE UPDATE ON user_organizations
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Create helper functions for multi-organization support
+CREATE OR REPLACE FUNCTION get_user_accessible_organizations(p_user_id UUID)
+RETURNS UUID[] AS $$
+BEGIN
+    RETURN ARRAY(
+        SELECT uo.organization_id 
+        FROM user_organizations uo 
+        WHERE uo.user_id = p_user_id
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION user_has_organization_access(p_user_id UUID, p_organization_id UUID)
+RETURNS BOOLEAN AS $$
+BEGIN
+    RETURN EXISTS(
+        SELECT 1 
+        FROM user_organizations uo 
+        WHERE uo.user_id = p_user_id 
+        AND uo.organization_id = p_organization_id
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_user_primary_organization(p_user_id UUID)
+RETURNS UUID AS $$
+DECLARE
+    primary_org_id UUID;
+BEGIN
+    SELECT uo.organization_id INTO primary_org_id
+    FROM user_organizations uo 
+    WHERE uo.user_id = p_user_id 
+    AND uo.is_primary = true;
+    
+    -- If no primary organization, return the first one
+    IF primary_org_id IS NULL THEN
+        SELECT uo.organization_id INTO primary_org_id
+        FROM user_organizations uo 
+        WHERE uo.user_id = p_user_id 
+        ORDER BY uo.created_at ASC
+        LIMIT 1;
+    END IF;
+    
+    RETURN primary_org_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Migrate existing admin user to the new structure
+INSERT INTO user_organizations (user_id, organization_id, role, is_primary, permissions)
+SELECT 
+    u.id, 
+    u.organization_id, 
+    u.role::text,
+    true, -- Set as primary organization
+    u.permissions
+FROM users u 
+WHERE u.organization_id IS NOT NULL
+AND NOT EXISTS (
+    SELECT 1 FROM user_organizations uo 
+    WHERE uo.user_id = u.id AND uo.organization_id = u.organization_id
+);
+
+-- Update current_organization_id to match their primary organization
+UPDATE users 
+SET current_organization_id = organization_id 
+WHERE current_organization_id IS NULL 
+AND organization_id IS NOT NULL;
+
+-- Create compliance assessment tables
+CREATE TABLE IF NOT EXISTS compliance_assessments (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    assessment_type assessment_type NOT NULL DEFAULT 'cis_v400',
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    status job_status NOT NULL DEFAULT 'pending',
+    progress INTEGER DEFAULT 0 CHECK (progress >= 0 AND progress <= 100),
+    total_controls INTEGER DEFAULT 0,
+    compliant_controls INTEGER DEFAULT 0,
+    non_compliant_controls INTEGER DEFAULT 0,
+    manual_review_controls INTEGER DEFAULT 0,
+    not_applicable_controls INTEGER DEFAULT 0,
+    error_controls INTEGER DEFAULT 0,
+    compliance_score DECIMAL(5,2) DEFAULT 0.00 CHECK (compliance_score >= 0 AND compliance_score <= 100),
+    weighted_score DECIMAL(5,2) DEFAULT 0.00 CHECK (weighted_score >= 0 AND weighted_score <= 100),
+    started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    duration INTEGER,
+    error_message TEXT,
+    error_details JSONB,
+    metadata JSONB DEFAULT '{}',
+    parameters JSONB DEFAULT '{}',
+    triggered_by UUID REFERENCES users(id),
+    is_scheduled BOOLEAN DEFAULT false,
+    is_baseline BOOLEAN DEFAULT false,
+    parent_schedule_id UUID,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS compliance_controls (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    assessment_type assessment_type NOT NULL DEFAULT 'cis_v400',
+    control_id VARCHAR(50) NOT NULL,
+    section VARCHAR(100) NOT NULL,
+    title VARCHAR(500) NOT NULL,
+    description TEXT NOT NULL,
+    rationale TEXT,
+    impact TEXT,
+    remediation TEXT,
+    severity control_severity NOT NULL DEFAULT 'level1',
+    weight DECIMAL(3,2) DEFAULT 1.00 CHECK (weight > 0),
+    graph_api_endpoint TEXT,
+    check_method TEXT,
+    expected_result JSONB,
+    is_active BOOLEAN DEFAULT true,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(assessment_type, control_id)
+);
+
+CREATE TABLE IF NOT EXISTS compliance_results (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    assessment_id UUID NOT NULL REFERENCES compliance_assessments(id) ON DELETE CASCADE,
+    control_id UUID NOT NULL REFERENCES compliance_controls(id) ON DELETE CASCADE,
+    status compliance_status NOT NULL,
+    score DECIMAL(5,2) DEFAULT 0.00 CHECK (score >= 0 AND score <= 100),
+    actual_result JSONB,
+    expected_result JSONB,
+    evidence JSONB,
+    remediation_guidance TEXT,
+    error_message TEXT,
+    error_details JSONB,
+    checked_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    metadata JSONB DEFAULT '{}',
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS compliance_schedules (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    organization_id UUID NOT NULL REFERENCES organizations(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    assessment_type assessment_type NOT NULL DEFAULT 'cis_v400',
+    frequency schedule_frequency NOT NULL,
+    is_active BOOLEAN DEFAULT true,
+    next_run_at TIMESTAMP WITH TIME ZONE,
+    last_run_at TIMESTAMP WITH TIME ZONE,
+    last_assessment_id UUID REFERENCES compliance_assessments(id),
+    parameters JSONB DEFAULT '{}',
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Create indexes for compliance tables
+CREATE INDEX IF NOT EXISTS idx_compliance_assessments_org_id ON compliance_assessments(organization_id);
+CREATE INDEX IF NOT EXISTS idx_compliance_assessments_status ON compliance_assessments(status);
+CREATE INDEX IF NOT EXISTS idx_compliance_assessments_created_at ON compliance_assessments(created_at);
+CREATE INDEX IF NOT EXISTS idx_compliance_assessments_baseline ON compliance_assessments(organization_id, is_baseline) WHERE is_baseline = true;
+CREATE INDEX IF NOT EXISTS idx_compliance_results_assessment_id ON compliance_results(assessment_id);
+CREATE INDEX IF NOT EXISTS idx_compliance_results_control_id ON compliance_results(control_id);
+CREATE INDEX IF NOT EXISTS idx_compliance_results_status ON compliance_results(status);
+CREATE INDEX IF NOT EXISTS idx_compliance_controls_assessment_type ON compliance_controls(assessment_type);
+CREATE INDEX IF NOT EXISTS idx_compliance_controls_active ON compliance_controls(is_active) WHERE is_active = true;
+CREATE INDEX IF NOT EXISTS idx_compliance_schedules_org_id ON compliance_schedules(organization_id);
+CREATE INDEX IF NOT EXISTS idx_compliance_schedules_next_run ON compliance_schedules(next_run_at) WHERE is_active = true;
+
+-- Record applied migrations
+INSERT INTO migrations (filename) VALUES 
+    ('001_initial_schema.sql'),
+    ('004_add_user_organization_support.sql'),
+    ('006_add_compliance_assessment.sql')
+ON CONFLICT (filename) DO NOTHING;
 
 -- Grant permissions
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA maes TO maes_user;

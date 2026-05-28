@@ -10,13 +10,14 @@ const { pool } = require('./services/database');
 const { logger } = require('./utils/logger');
 const { rateLimiter } = require('./middleware/rateLimiter');
 const { redirectHandler } = require('./middleware/redirectHandler');
+const { register, trackHttpRequests } = require('./utils/metrics');
 const swaggerSpecs = require('./swagger');
-const elasticsearchService = require('./services/elasticsearch');
 
 // Import routes
 const authRoutes = require('./routes/auth');
 const organizationRoutes = require('./routes/organizations');
 const userRoutes = require('./routes/users');
+const userProfileRoutes = require('./routes/user');
 const extractionRoutes = require('./routes/extractions');
 const analysisRoutes = require('./routes/analysis');
 const alertRoutes = require('./routes/alerts');
@@ -24,9 +25,22 @@ const reportRoutes = require('./routes/reports');
 const uploadRoutes = require('./routes/upload');
 const registrationRoutes = require('./routes/registration');
 const siemRoutes = require('./routes/siem');
-const elasticsearchRoutes = require('./routes/elasticsearch');
+const internalRoutes = require('./routes/internal');
+const systemRoutes = require('./routes/system');
+const complianceRoutes = require('./routes/compliance');
+const uebaRoutes = require('./routes/ueba');
+const incidentRoutes = require('./routes/incidents');
+const threatIntelRoutes = require('./routes/threatIntel');
+const savedIOCsRoutes = require('./routes/savedIOCs');
 
 const app = express();
+const requiredEnvVars = ['JWT_SECRET', 'SERVICE_AUTH_TOKEN', 'ENCRYPTION_KEY'];
+
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    throw new Error(`Missing required environment variable: ${envVar}`);
+  }
+}
 
 // Trust proxy for rate limiting behind nginx
 app.set('trust proxy', 1);
@@ -37,7 +51,7 @@ app.use(helmet({
     directives: {
       defaultSrc: ["'self'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'", "'unsafe-inline'", "'unsafe-eval'"], // Allow inline scripts for Swagger UI
+      scriptSrc: ["'self'", "'unsafe-inline'"],
       imgSrc: ["'self'", "data:", "https:"],
       fontSrc: ["'self'", "data:"],
       connectSrc: ["'self'"],
@@ -52,25 +66,30 @@ app.use(compression());
 const buildCorsOrigins = () => {
   const origins = [];
 
-  // Always include localhost for development
-  origins.push(
-    'https://localhost',
-    'https://localhost:443',
-    'http://localhost:8080',
-    'http://localhost',
-    'http://localhost:3000',
-    'https://localhost:3000'
-  );
+  const isDevelopment = (process.env.NODE_ENV || 'development') !== 'production';
+
+  if (isDevelopment) {
+    origins.push(
+      'https://localhost',
+      'https://localhost:443',
+      'http://localhost:8080',
+      'http://localhost',
+      'http://localhost:3000',
+      'https://localhost:3000'
+    );
+  }
 
   // Add DOMAIN if provided
   if (process.env.DOMAIN) {
     const domain = process.env.DOMAIN;
     origins.push(
       `https://${domain}`,
-      `http://${domain}`,
-      `https://${domain}:443`,
-      `http://${domain}:80`
+      `https://${domain}:443`
     );
+
+    if (isDevelopment) {
+      origins.push(`http://${domain}`, `http://${domain}:80`);
+    }
   }
 
   // Add PUBLIC_IP if provided
@@ -78,10 +97,12 @@ const buildCorsOrigins = () => {
     const publicIP = process.env.PUBLIC_IP;
     origins.push(
       `https://${publicIP}`,
-      `http://${publicIP}`,
-      `https://${publicIP}:443`,
-      `http://${publicIP}:80`
+      `https://${publicIP}:443`
     );
+
+    if (isDevelopment) {
+      origins.push(`http://${publicIP}`, `http://${publicIP}:80`);
+    }
   }
 
   // Add FRONTEND_URL if provided
@@ -148,6 +169,9 @@ app.use(rateLimiter);
 // Redirect handler middleware
 app.use(redirectHandler);
 
+// Metrics tracking middleware
+app.use(trackHttpRequests);
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -155,6 +179,16 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     version: process.env.npm_package_version || '1.0.0'
   });
+});
+
+// Metrics endpoint for Prometheus
+app.get('/metrics', async (req, res) => {
+  try {
+    res.set('Content-Type', register.contentType);
+    res.end(await register.metrics());
+  } catch (ex) {
+    res.status(500).end(ex);
+  }
 });
 
 // API documentation with custom options
@@ -170,10 +204,22 @@ const swaggerOptions = {
 app.use('/api/docs', swaggerUi.serve);
 app.get('/api/docs', swaggerUi.setup(swaggerSpecs, swaggerOptions));
 
+// Health check endpoint
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    version: process.env.npm_package_version || '1.0.0',
+    environment: process.env.NODE_ENV || 'development'
+  });
+});
+
 // Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/organizations', organizationRoutes);
 app.use('/api/users', userRoutes);
+app.use('/api/user', userProfileRoutes);
 app.use('/api/extractions', extractionRoutes);
 app.use('/api/analysis', analysisRoutes);
 app.use('/api/alerts', alertRoutes);
@@ -181,7 +227,13 @@ app.use('/api/reports', reportRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/registration', registrationRoutes);
 app.use('/api/siem', siemRoutes);
-app.use('/api/elasticsearch', elasticsearchRoutes);
+app.use('/api/internal', internalRoutes);
+app.use('/api/system', systemRoutes);
+app.use('/api/compliance', complianceRoutes);
+app.use('/api/ueba', uebaRoutes);
+app.use('/api/incidents', incidentRoutes);
+app.use('/api/threat-intel', threatIntelRoutes);
+app.use('/api/threat-intel', savedIOCsRoutes);
 
 // Certificate download endpoint
 app.get('/api/certificates/app.crt', (req, res) => {
@@ -269,9 +321,12 @@ async function startServer() {
     await pool.query('SELECT NOW()');
     logger.info('Database connection established successfully');
 
-    // Initialize Elasticsearch service
-    await elasticsearchService.initialize();
-    logger.info('Elasticsearch service initialized successfully');
+    // Run database migrations
+    logger.info('Running database migrations...');
+    const MigrationManager = require('./utils/migrate');
+    const migrationManager = new MigrationManager();
+    await migrationManager.runPendingMigrations();
+    logger.info('Database migrations completed');
 
     // Start server
     httpServer.listen(PORT, () => {

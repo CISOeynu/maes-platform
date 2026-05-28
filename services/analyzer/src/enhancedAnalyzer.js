@@ -1,14 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const csv = require('csv-parser');
-const { Client } = require('@elastic/elasticsearch');
 const { logger } = require('./logger');
 
 class EnhancedAnalyzer {
   constructor() {
     this.blacklists = {};
     this.config = {};
-    this.elasticsearchClient = null;
     this.initialized = false;
   }
 
@@ -18,7 +16,6 @@ class EnhancedAnalyzer {
     try {
       await this.loadBlacklists();
       await this.loadConfig();
-      await this.initializeElasticsearch();
       this.initialized = true;
       logger.info('Enhanced analyzer initialized successfully');
     } catch (error) {
@@ -27,25 +24,6 @@ class EnhancedAnalyzer {
     }
   }
 
-  async initializeElasticsearch() {
-    try {
-      const elasticsearchUrl = process.env.ELASTICSEARCH_URL || 'http://localhost:9200';
-      
-      this.elasticsearchClient = new Client({
-        node: elasticsearchUrl,
-        maxRetries: 3,
-        requestTimeout: 10000,
-        sniffOnStart: false
-      });
-
-      // Test connection
-      await this.elasticsearchClient.ping();
-      logger.info('Elasticsearch connection established in analyzer');
-    } catch (error) {
-      logger.error('Failed to initialize Elasticsearch in analyzer:', error);
-      // Don't throw error - Elasticsearch is optional for analyzer
-    }
-  }
 
   async loadBlacklists() {
     const blacklistDir = path.join(__dirname, '../config/Blacklists');
@@ -66,13 +44,49 @@ class EnhancedAnalyzer {
         const listName = file.replace('-Blacklist.csv', '').toLowerCase();
         this.blacklists[listName] = await this.loadCsvFile(filePath);
         logger.info(`Loaded ${listName} blacklist: ${this.blacklists[listName].length} entries`);
+      } else {
+        logger.warn(`Blacklist file not found: ${filePath}`)
       }
+    }
+    
+    // Load whitelists
+    const whitelistDir = path.join(__dirname, '../config/Whitelists');
+    this.whitelists = {};
+    if (fs.existsSync(path.join(whitelistDir, 'ASN-Whitelist.csv'))) {
+      this.whitelists.asn = await this.loadCsvFile(path.join(whitelistDir, 'ASN-Whitelist.csv'));
+      logger.info(`Loaded ASN whitelist: ${this.whitelists.asn?.length || 0} entries`);
     }
   }
 
   async loadConfig() {
-    const configDir = path.join(__dirname, '../config/Config');
+    // Load main configuration from Config.json
+    const mainConfigPath = path.join(__dirname, '../config/Config.json');
+    if (fs.existsSync(mainConfigPath)) {
+      try {
+        const configContent = fs.readFileSync(mainConfigPath, 'utf8');
+        const mainConfig = JSON.parse(configContent);
+        this.config = { ...mainConfig };
+        logger.info('Loaded main configuration from Config.json');
+      } catch (error) {
+        logger.error('Failed to load Config.json:', error);
+        this.config = {};
+      }
+    }
     
+    // Add detection thresholds
+    this.config.thresholds = {
+      bruteForce: 1000,
+      failedLogins: 50,
+      suspiciousActivity: 5,
+      highRisk: 10,
+      timeWindowMinutes: 30,
+      multipleFailedLoginsPerUser: 10,
+      suspiciousIPActivityCount: 500,
+      unusualLocationChanges: 5
+    };
+    
+    // Load CSV configurations
+    const configDir = path.join(__dirname, '../config/Config');
     const configFiles = [
       'LogonType.csv',
       'MicrosoftApps.csv',
@@ -126,16 +140,40 @@ class EnhancedAnalyzer {
         countries: new Set(),
         ipAddresses: new Set(),
         userAgents: new Set()
+      },
+      dataQuality: {
+        unknownUsers: 0,
+        missingUserData: 0,
+        totalUnknownEvents: 0,
+        unknownUserTypes: new Set()
       }
     };
 
     logger.info(`Starting enhanced analysis of ${auditData.length} audit log entries`);
+
+    // Track unknown users for logging
+    const unknownUserDetails = [];
 
     for (let i = 0; i < auditData.length; i++) {
       const event = auditData[i];
       
       // Handle different log formats
       const normalizedEvent = this.normalizeAuditEvent(event);
+      
+      // Log unknown user events for monitoring
+      if (normalizedEvent.isUnknownUser) {
+        unknownUserDetails.push({
+          user: normalizedEvent.user,
+          operation: normalizedEvent.operation,
+          timestamp: normalizedEvent.timestamp,
+          ip: normalizedEvent.ipAddress
+        });
+        
+        // Log every 100th unknown user event to avoid log spam
+        if (unknownUserDetails.length % 100 === 0) {
+          logger.warn(`Found ${unknownUserDetails.length} events with unknown users so far`);
+        }
+      }
       
       // Update statistics
       this.updateStatistics(normalizedEvent, statistics);
@@ -147,6 +185,7 @@ class EnhancedAnalyzer {
       await this.checkPermissionChanges(normalizedEvent, findings, statistics);
       await this.checkAccountActivities(normalizedEvent, findings, statistics);
       await this.checkApplicationActivities(normalizedEvent, findings, statistics);
+      await this.checkTokenProtection(normalizedEvent, findings, statistics);
       
       // Check for brute force attempts
       if (i > 0) {
@@ -167,6 +206,12 @@ class EnhancedAnalyzer {
     statistics.blacklistedEntities.countries = statistics.blacklistedEntities.countries.size;
     statistics.blacklistedEntities.ipAddresses = statistics.blacklistedEntities.ipAddresses.size;
     statistics.blacklistedEntities.userAgents = statistics.blacklistedEntities.userAgents.size;
+    statistics.dataQuality.unknownUserTypes = Array.from(statistics.dataQuality.unknownUserTypes);
+
+    // Calculate data quality percentage
+    const dataQualityPercentage = statistics.totalEvents > 0 
+      ? ((statistics.totalEvents - statistics.dataQuality.totalUnknownEvents) / statistics.totalEvents * 100).toFixed(2)
+      : 100;
 
     const summary = {
       totalFindings: findings.length,
@@ -174,11 +219,29 @@ class EnhancedAnalyzer {
       highSeverityFindings: findings.filter(f => f.severity === 'high').length,
       mediumSeverityFindings: findings.filter(f => f.severity === 'medium').length,
       lowSeverityFindings: findings.filter(f => f.severity === 'low').length,
+      dataQualityFindings: findings.filter(f => f.category === 'data_quality').length,
       topThreats: this.identifyTopThreats(findings),
-      riskScore: this.calculateRiskScore(findings, statistics)
+      riskScore: this.calculateRiskScore(findings, statistics),
+      dataQuality: {
+        score: dataQualityPercentage,
+        unknownUserEvents: statistics.dataQuality.unknownUsers,
+        totalUnknownEvents: statistics.dataQuality.totalUnknownEvents,
+        message: dataQualityPercentage < 80 ? 'Poor data quality detected - many events have missing user identification' : 'Good data quality'
+      }
     };
 
-    logger.info(`Enhanced analysis completed: ${findings.length} findings, Risk Score: ${summary.riskScore}`);
+    // Log data quality summary
+    if (statistics.dataQuality.unknownUsers > 0) {
+      logger.warn(`Data Quality Alert: ${statistics.dataQuality.unknownUsers} events with unknown users detected`);
+      logger.warn(`Unknown user types found: ${statistics.dataQuality.unknownUserTypes.join(', ')}`);
+      logger.info(`Data quality score: ${dataQualityPercentage}%`);
+      
+      if (unknownUserDetails.length > 0) {
+        logger.debug(`Sample unknown user events:`, unknownUserDetails.slice(0, 5));
+      }
+    }
+
+    logger.info(`Enhanced analysis completed: ${findings.length} findings, Risk Score: ${summary.riskScore}, Data Quality: ${dataQualityPercentage}%`);
 
     return {
       findings: findings,
@@ -187,78 +250,81 @@ class EnhancedAnalyzer {
     };
   }
 
-  async indexAnalysisResults(extractionId, analysisResults) {
-    if (!this.elasticsearchClient) return;
-
-    try {
-      const documents = [];
-      
-      // Index findings
-      for (const finding of analysisResults.findings) {
-        documents.push({
-          index: { _index: 'maes-analysis-results' }
-        });
-        documents.push({
-          '@timestamp': new Date(),
-          extraction_id: extractionId,
-          finding_id: finding.id,
-          severity: finding.severity,
-          type: finding.type,
-          title: finding.title,
-          description: finding.description,
-          evidence: finding.evidence,
-          mitre_techniques: finding.mitreTechniques,
-          recommendations: finding.recommendations,
-          metadata: finding.metadata
-        });
-      }
-
-      if (documents.length > 0) {
-        await this.elasticsearchClient.bulk({ body: documents });
-        logger.info(`Indexed ${analysisResults.findings.length} analysis results to Elasticsearch`);
-      }
-    } catch (error) {
-      logger.error('Failed to index analysis results to Elasticsearch:', error);
-    }
-  }
 
   normalizeAuditEvent(event) {
     // Handle different audit log formats (Graph API, PowerShell, etc.)
+    
+    // Extract user with better fallback handling including AuditData nesting
+    let user = event.initiatedBy?.user?.userPrincipalName || 
+               event.initiatedBy?.user?.displayName || 
+               event.AuditData?.UserId ||              // Check nested AuditData
+               event.AuditData?.UserPrincipalName ||   // Check nested AuditData  
+               event.AuditData?.User ||                // Check nested AuditData
+               event.AuditData?.UserIds?.[0] ||        // Check array format
+               event.UserId || 
+               event.UserPrincipalName || 
+               event.UserDisplayName ||
+               event.Actor?.ID ||
+               event.Actor?.Name ||
+               event.User ||
+               null;
+    
+    // If user is still not found, create a unique identifier based on other properties
+    if (!user || user === '' || user.toLowerCase() === 'unknown') {
+      // Try to create a unique identifier from available data (including AuditData nesting)
+      const sessionId = event.SessionId || event.AuditData?.SessionId || event.CorrelationId || event.AuditData?.CorrelationId || '';
+      const ip = event.initiatedBy?.user?.ipAddress || event.AuditData?.ClientIP || event.ClientIP || event.IPAddress || '';
+      const app = event.initiatedBy?.app?.displayName || event.initiatedBy?.app?.appId || event.AuditData?.ApplicationId || event.ApplicationId || '';
+      
+      if (sessionId) {
+        user = `Unknown_Session_${sessionId.substring(0, 8)}`;
+      } else if (ip && ip !== 'Unknown') {
+        user = `Unknown_IP_${ip.replace(/\./g, '_')}`;
+      } else if (app && app !== 'Unknown') {
+        user = `Unknown_App_${app.substring(0, 20)}`;
+      } else {
+        // Last resort: use timestamp and random ID to ensure uniqueness
+        const timestamp = new Date(event.activityDateTime || event.CreationTime || event.TimeGenerated || Date.now());
+        user = `Unknown_${timestamp.getTime()}_${Math.random().toString(36).substring(2, 7)}`;
+      }
+    }
+    
     return {
-      id: event.id || event.Id || `event_${Date.now()}_${Math.random()}`,
-      timestamp: new Date(event.activityDateTime || event.CreationTime || event.TimeGenerated || event.Timestamp),
-      user: event.initiatedBy?.user?.userPrincipalName || 
-            event.initiatedBy?.user?.displayName || 
-            event.UserId || 
-            event.UserPrincipalName || 
-            event.UserDisplayName ||
-            'Unknown',
-      operation: event.activityDisplayName || event.Operation || event.ActivityDisplayName || 'Unknown',
-      result: event.result || event.ResultStatus || event.Status || 'Unknown',
+      id: event.id || event.AuditData?.Id || event.Id || `event_${Date.now()}_${Math.random()}`,
+      timestamp: new Date(event.activityDateTime || event.AuditData?.CreationTime || event.CreationTime || event.TimeGenerated || event.Timestamp),
+      user: user,
+      operation: event.activityDisplayName || event.AuditData?.Operation || event.Operation || event.ActivityDisplayName || 'Unknown',
+      result: event.result || event.AuditData?.ResultStatus || event.ResultStatus || event.Status || 'Unknown',
       ipAddress: event.initiatedBy?.user?.ipAddress || 
+                event.AuditData?.ClientIP || 
                 event.ClientIP || 
                 event.IPAddress || 
                 event.location?.countryOrRegion || 
                 'Unknown',
       userAgent: event.initiatedBy?.user?.userAgent || 
+                event.AuditData?.UserAgent || 
                 event.UserAgent || 
                 event.ClientAppUsed || 
                 'Unknown',
       application: event.initiatedBy?.app?.displayName || 
                   event.initiatedBy?.app?.appId || 
+                  event.AuditData?.AppDisplayName || 
+                  event.AuditData?.ApplicationId || 
                   event.AppDisplayName || 
                   event.ApplicationId || 
                   event.ClientAppUsed ||
                   'Unknown',
       location: event.location?.countryOrRegion || 
                event.location?.city || 
+               event.AuditData?.Country || 
                event.Country || 
                event.Location ||
                'Unknown',
-      category: event.category || event.LogName || event.RecordType || 'Unknown',
-      targetResources: event.targetResources || [],
-      additionalDetails: event.additionalDetails || [],
-      rawEvent: event
+      category: event.category || event.AuditData?.LogName || event.AuditData?.RecordType || event.LogName || event.RecordType || 'Unknown',
+      targetResources: event.targetResources || event.AuditData?.targetResources || [],
+      additionalDetails: event.additionalDetails || event.AuditData?.additionalDetails || [],
+      rawEvent: event,
+      isUnknownUser: user.startsWith('Unknown_')  // Flag to track unknown users
     };
   }
 
@@ -269,6 +335,28 @@ class EnhancedAnalyzer {
     statistics.uniqueCountries.add(event.location);
     statistics.uniqueIPAddresses.add(event.ipAddress);
 
+    // Track data quality issues
+    if (event.isUnknownUser) {
+      statistics.dataQuality.unknownUsers++;
+      
+      // Track the type of unknown user
+      if (event.user.startsWith('Unknown_Session_')) {
+        statistics.dataQuality.unknownUserTypes.add('session-based');
+      } else if (event.user.startsWith('Unknown_IP_')) {
+        statistics.dataQuality.unknownUserTypes.add('ip-based');
+      } else if (event.user.startsWith('Unknown_App_')) {
+        statistics.dataQuality.unknownUserTypes.add('app-based');
+      } else if (event.user.startsWith('Unknown_')) {
+        statistics.dataQuality.unknownUserTypes.add('timestamp-based');
+      }
+    }
+    
+    // Count events with any unknown data
+    if (event.user.includes('Unknown') || event.operation === 'Unknown' || 
+        event.application === 'Unknown' || event.location === 'Unknown') {
+      statistics.dataQuality.totalUnknownEvents++;
+    }
+
     if (event.result === 'success' || event.result === 'Success') {
       statistics.successOperations++;
     } else if (event.result === 'failure' || event.result === 'Failure' || event.result === 'failed') {
@@ -277,19 +365,36 @@ class EnhancedAnalyzer {
   }
 
   async checkBlacklistedEntities(event, findings, statistics) {
-    // Check against application blacklist
+    // Check against application blacklist with severity levels
     if (this.blacklists.application && event.application !== 'Unknown') {
       const blacklistedApp = this.blacklists.application.find(app => 
-        app.AppDisplayName && event.application.toLowerCase().includes(app.AppDisplayName.toLowerCase())
+        (app.AppDisplayName && event.application.toLowerCase().includes(app.AppDisplayName.toLowerCase())) ||
+        (app.AppId && event.application === app.AppId)
       );
       
       if (blacklistedApp) {
         statistics.blacklistedEntities.applications.add(event.application);
+        
+        // Use severity from blacklist (Red=critical, Yellow=medium, default=high)
+        const severity = blacklistedApp.Severity?.toLowerCase() === 'red' ? 'critical' : 
+                        blacklistedApp.Severity?.toLowerCase() === 'yellow' ? 'medium' : 'high';
+        
+        // Special handling for known malicious apps
+        const specialApps = {
+          'eM Client': 'Known traitorware used for data exfiltration',
+          'Visual Studio Code': 'Potentially used for unauthorized development access',
+          'rclone': 'Cloud storage tool often used for mass data exfiltration',
+          'CloudSponge': 'Contact harvesting application',
+          'Mailbackup': 'Email backup tool that can exfiltrate mailbox data'
+        };
+        
+        const specialNote = specialApps[blacklistedApp.AppDisplayName] || '';
+        
         findings.push({
           id: `finding_${findings.length + 1}`,
           title: 'Blacklisted Application Detected',
-          severity: 'high',
-          description: `Blacklisted application "${event.application}" was used by ${event.user}`,
+          severity: severity,
+          description: `Blacklisted application "${event.application}" was used by ${event.user}. ${specialNote}`,
           timestamp: event.timestamp,
           source: 'entra_audit_logs',
           type: 'blacklisted_application',
@@ -446,6 +551,49 @@ class EnhancedAnalyzer {
         severity: 'critical',
         type: 'mfa_disable',
         description: 'MFA disable activity detected'
+      },
+      // New patterns from Microsoft-Analyzer-Suite v1.6.0
+      {
+        pattern: /UpdateInboxRules.*Create|UpdateInboxRules.*Update|UpdateInboxRules.*Delete/i,
+        severity: 'high',
+        type: 'inbox_rule_manipulation',
+        description: 'Suspicious inbox rule manipulation detected'
+      },
+      {
+        pattern: /MailItemsAccessed/i,
+        severity: 'medium',
+        type: 'mail_items_accessed',
+        description: 'Mail items accessed - potential data exfiltration'
+      },
+      {
+        pattern: /FileDownloaded/i,
+        severity: 'medium',
+        type: 'file_download',
+        description: 'File download activity - monitor for mass downloads'
+      },
+      {
+        pattern: /cloud.*device.*registration/i,
+        severity: 'high',
+        type: 'cloud_device_registration',
+        description: 'Suspicious cloud device registration detected'
+      },
+      {
+        pattern: /adrs.*token.*request/i,
+        severity: 'high',
+        type: 'adrs_token_request',
+        description: 'Suspicious ADRS token request detected'
+      },
+      {
+        pattern: /visual.*studio.*code/i,
+        severity: 'medium',
+        type: 'vscode_signin',
+        description: 'Sign-in via Visual Studio Code detected - potential security risk'
+      },
+      {
+        pattern: /em.*client/i,
+        severity: 'critical',
+        type: 'em_client_usage',
+        description: 'eM Client detected - known traitorware application'
       }
     ];
 
@@ -728,6 +876,133 @@ class EnhancedAnalyzer {
     }
   }
 
+  async checkTokenProtection(event, findings, statistics) {
+    // Check for token protection related issues based on Microsoft-Analyzer-Suite v1.6.0
+    
+    // Check for unique token identifier issues
+    if (event.uniqueTokenIdentifier || event.UniqueTokenIdentifier) {
+      const tokenId = event.uniqueTokenIdentifier || event.UniqueTokenIdentifier;
+      
+      // Check for token replay attacks
+      if (tokenId && tokenId.length > 0) {
+        // Log for future correlation analysis
+        logger.debug(`Token ID detected: ${tokenId.substring(0, 8)}... for user ${event.user}`);
+      }
+    }
+    
+    // Check for incoming token type anomalies
+    if (event.incomingTokenType || event.IncomingTokenType) {
+      const tokenType = event.incomingTokenType || event.IncomingTokenType;
+      
+      // Check for unusual token types
+      const suspiciousTokenTypes = ['none', 'unknown', 'legacy'];
+      if (suspiciousTokenTypes.includes(tokenType.toLowerCase())) {
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'Suspicious Token Type Detected',
+          severity: 'medium',
+          description: `Unusual incoming token type "${tokenType}" detected for user ${event.user}`,
+          timestamp: event.timestamp,
+          source: 'entra_audit_logs',
+          type: 'token_anomaly',
+          category: 'authentication',
+          affectedEntities: {
+            users: [event.user],
+            tokenType: tokenType
+          },
+          evidence: {
+            tokenType: tokenType,
+            operation: event.operation,
+            result: event.result
+          },
+          mitreAttack: {
+            tactics: ['Credential Access', 'Lateral Movement'],
+            techniques: ['T1550', 'T1550.001'],
+            subTechniques: []
+          },
+          recommendations: [
+            'Review token issuance policies',
+            'Verify user authentication methods',
+            'Check for legacy authentication usage'
+          ]
+        });
+      }
+    }
+    
+    // Check for sign-in token protection status
+    if (event.signInTokenProtectionStatus || event.SignInTokenProtectionStatus) {
+      const protectionStatus = event.signInTokenProtectionStatus || event.SignInTokenProtectionStatus;
+      
+      // Flag unprotected or weakly protected tokens
+      if (protectionStatus.toLowerCase() === 'none' || protectionStatus.toLowerCase() === 'notapplied') {
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'Unprotected Sign-In Token',
+          severity: 'high',
+          description: `Sign-in token without protection detected for user ${event.user}`,
+          timestamp: event.timestamp,
+          source: 'entra_audit_logs',
+          type: 'unprotected_token',
+          category: 'authentication',
+          affectedEntities: {
+            users: [event.user],
+            protectionStatus: protectionStatus
+          },
+          evidence: {
+            protectionStatus: protectionStatus,
+            operation: event.operation,
+            ipAddress: event.ipAddress
+          },
+          mitreAttack: {
+            tactics: ['Initial Access', 'Credential Access'],
+            techniques: ['T1078', 'T1550'],
+            subTechniques: ['T1078.004', 'T1550.001']
+          },
+          recommendations: [
+            'Enable token protection for all users',
+            'Enforce Conditional Access policies',
+            'Review sign-in security settings'
+          ]
+        });
+      }
+    }
+    
+    // Check for ADRS token requests (Azure Device Registration Service)
+    if (event.operation && event.operation.toLowerCase().includes('adrs') && 
+        event.operation.toLowerCase().includes('token')) {
+      findings.push({
+        id: `finding_${findings.length + 1}`,
+        title: 'Suspicious ADRS Token Request',
+        severity: 'high',
+        description: `ADRS token request detected from ${event.user} - potential device registration abuse`,
+        timestamp: event.timestamp,
+        source: 'entra_audit_logs',
+        type: 'adrs_token_request',
+        category: 'device_security',
+        affectedEntities: {
+          users: [event.user],
+          operation: event.operation
+        },
+        evidence: {
+          operation: event.operation,
+          result: event.result,
+          ipAddress: event.ipAddress,
+          userAgent: event.userAgent
+        },
+        mitreAttack: {
+          tactics: ['Persistence', 'Defense Evasion'],
+          techniques: ['T1098', 'T1556'],
+          subTechniques: ['T1098.005']
+        },
+        recommendations: [
+          'Review device registration policies',
+          'Verify if device registration is legitimate',
+          'Check for unusual device enrollment patterns'
+        ]
+      });
+    }
+  }
+
   async checkBruteForcePatterns(event, recentEvents, findings, statistics) {
     if (event.result === 'failure' || event.result === 'Failure' || event.result === 'failed') {
       const failureCount = recentEvents.filter(e => {
@@ -803,7 +1078,45 @@ class EnhancedAnalyzer {
 
     // Detect anomalous user behavior
     for (const [user, activities] of userActivityMap) {
-      if (activities.length > 1000) { // High activity threshold
+      // Skip or handle unknown users differently
+      const isUnknownUser = user.startsWith('Unknown_');
+      
+      if (isUnknownUser) {
+        // For unknown users, don't create high activity alerts
+        // Instead, check if there's a data quality issue
+        if (activities.length > 100) { // Lower threshold for unknown users
+          findings.push({
+            id: `finding_${findings.length + 1}`,
+            title: 'Data Quality Issue - Missing User Identification',
+            severity: 'low',
+            description: `${activities.length} events have missing user identification data. These events are tracked as ${user}`,
+            timestamp: new Date(),
+            source: 'entra_audit_logs',
+            type: 'data_quality_issue',
+            category: 'data_quality',
+            affectedEntities: {
+              users: [user]
+            },
+            evidence: {
+              activityCount: activities.length,
+              userIdentifier: user,
+              sampleOperations: activities.slice(0, 5).map(a => a.operation),
+              timespan: 'Analysis period'
+            },
+            mitreAttack: {
+              tactics: [],
+              techniques: [],
+              subTechniques: []
+            },
+            recommendations: [
+              'Review log collection configuration',
+              'Ensure proper user identification fields are captured',
+              'Check if authentication logs are complete',
+              'Consider enabling additional audit log fields'
+            ]
+          });
+        }
+      } else if (activities.length > 1000) { // High activity threshold for known users
         findings.push({
           id: `finding_${findings.length + 1}`,
           title: 'Unusually High User Activity',
@@ -818,7 +1131,8 @@ class EnhancedAnalyzer {
           },
           evidence: {
             activityCount: activities.length,
-            timespan: 'Analysis period'
+            timespan: 'Analysis period',
+            isIdentifiedUser: true
           },
           mitreAttack: {
             tactics: ['Collection', 'Exfiltration'],
@@ -999,6 +1313,516 @@ class EnhancedAnalyzer {
     score += statistics.blacklistedEntities.userAgents * 1;
 
     return Math.min(100, Math.round(score));
+  }
+
+  // Analyze MFA data from Microsoft Graph
+  async analyzeMfaData(mfaData, parameters) {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    const findings = [];
+    const statistics = {
+      totalUsers: mfaData.length,
+      mfaEnabled: 0,
+      mfaDisabled: 0,
+      strongAuthMethods: 0,
+      weakAuthMethods: 0,
+      suspiciousActivities: 0
+    };
+
+    for (const user of mfaData) {
+      // MFA extractor uses lowercase 'user' field and 'MFAstatus' with specific casing
+      const userPrincipalName = user.user || user.UserPrincipalName || user.userPrincipalName || 'Unknown';
+      const mfaStatus = user.MFAstatus || user.mfaStatus || user.MfaStatus || 'Unknown';
+      const authMethods = user.authMethods || user.AuthMethods || [];
+
+      if (mfaStatus === 'Enabled') {
+        statistics.mfaEnabled++;
+      } else {
+        statistics.mfaDisabled++;
+        
+        // Create finding for disabled MFA
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'MFA Disabled for User',
+          severity: 'high',
+          description: `User ${userPrincipalName} has MFA disabled`,
+          timestamp: new Date(),
+          source: 'mfa_graph_data',
+          type: 'mfa_disabled',
+          category: 'security',
+          affectedEntities: {
+            users: [userPrincipalName],
+            resources: [],
+            applications: []
+          },
+          evidence: {
+            userPrincipalName,
+            mfaStatus,
+            authMethods
+          },
+          mitreAttack: {
+            tactics: ['Defense Evasion', 'Credential Access'],
+            techniques: ['T1556', 'T1110'],
+            subTechniques: ['T1556.001', 'T1110.001']
+          },
+          recommendations: [
+            'Enable MFA for this user immediately',
+            'Review MFA policy compliance',
+            'Investigate why MFA was disabled'
+          ]
+        });
+      }
+
+      // Check for weak authentication methods
+      if (authMethods.length > 0) {
+        const weakMethods = authMethods.filter(method => 
+          method.toLowerCase().includes('sms') || 
+          method.toLowerCase().includes('voice') ||
+          method.toLowerCase().includes('email')
+        );
+        
+        if (weakMethods.length > 0) {
+          statistics.weakAuthMethods++;
+          findings.push({
+            id: `finding_${findings.length + 1}`,
+            title: 'Weak MFA Method Detected',
+            severity: 'medium',
+            description: `User ${userPrincipalName} is using weak MFA methods: ${weakMethods.join(', ')}`,
+            timestamp: new Date(),
+            source: 'mfa_graph_data',
+            type: 'weak_mfa_method',
+            category: 'security',
+            affectedEntities: {
+              users: [userPrincipalName],
+              resources: [],
+              applications: []
+            },
+            evidence: {
+              userPrincipalName,
+              weakMethods,
+              allMethods: authMethods
+            },
+            mitreAttack: {
+              tactics: ['Defense Evasion'],
+              techniques: ['T1556'],
+              subTechniques: ['T1556.001']
+            },
+            recommendations: [
+              'Upgrade to stronger MFA methods (authenticator app, hardware token)',
+              'Disable SMS/voice-based MFA',
+              'Review organizational MFA policy'
+            ]
+          });
+        } else {
+          statistics.strongAuthMethods++;
+        }
+      }
+    }
+
+    return {
+      findings,
+      statistics,
+      summary: {
+        totalFindings: findings.length,
+        highSeverityFindings: findings.filter(f => f.severity === 'high').length,
+        mediumSeverityFindings: findings.filter(f => f.severity === 'medium').length,
+        lowSeverityFindings: findings.filter(f => f.severity === 'low').length
+      }
+    };
+  }
+
+  // Analyze Device data from Microsoft Graph
+  async analyzeDeviceData(deviceData, parameters) {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    const findings = [];
+    const statistics = {
+      totalDevices: deviceData.length,
+      compliantDevices: 0,
+      nonCompliantDevices: 0,
+      managedDevices: 0,
+      unmanagedDevices: 0,
+      suspiciousDevices: 0
+    };
+
+    for (const device of deviceData) {
+      const deviceName = device.DisplayName || device.displayName || device.DeviceName || 'Unknown';
+      const isCompliant = device.IsCompliant !== undefined ? device.IsCompliant : (device.isCompliant || false);
+      const isManaged = device.IsManaged !== undefined ? device.IsManaged : (device.isManaged || false);
+      const operatingSystem = device.OperatingSystem || device.operatingSystem || 'Unknown';
+      const lastSeenDateTime = device.LastSignInDateTime || device.lastSeenDateTime || device.ApproximateLastSignInDateTime;
+
+      if (isCompliant) {
+        statistics.compliantDevices++;
+      } else {
+        statistics.nonCompliantDevices++;
+        
+        // Create finding for non-compliant device
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'Non-Compliant Device Detected',
+          severity: 'medium',
+          description: `Device ${deviceName} is not compliant with organizational policies`,
+          timestamp: new Date(),
+          source: 'device_graph_data',
+          type: 'non_compliant_device',
+          category: 'security',
+          affectedEntities: {
+            devices: [deviceName],
+            resources: [],
+            applications: []
+          },
+          evidence: {
+            deviceName,
+            isCompliant,
+            isManaged,
+            operatingSystem,
+            lastSeenDateTime
+          },
+          mitreAttack: {
+            tactics: ['Initial Access', 'Persistence'],
+            techniques: ['T1078', 'T1566'],
+            subTechniques: ['T1078.004', 'T1566.001']
+          },
+          recommendations: [
+            'Review device compliance policies',
+            'Remediate compliance issues',
+            'Consider blocking non-compliant devices'
+          ]
+        });
+      }
+
+      if (isManaged) {
+        statistics.managedDevices++;
+      } else {
+        statistics.unmanagedDevices++;
+        
+        // Create finding for unmanaged device
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'Unmanaged Device Detected',
+          severity: 'high',
+          description: `Device ${deviceName} is not managed by the organization`,
+          timestamp: new Date(),
+          source: 'device_graph_data',
+          type: 'unmanaged_device',
+          category: 'security',
+          affectedEntities: {
+            devices: [deviceName],
+            resources: [],
+            applications: []
+          },
+          evidence: {
+            deviceName,
+            isCompliant,
+            isManaged,
+            operatingSystem,
+            lastSeenDateTime
+          },
+          mitreAttack: {
+            tactics: ['Initial Access', 'Persistence'],
+            techniques: ['T1078', 'T1566'],
+            subTechniques: ['T1078.004', 'T1566.001']
+          },
+          recommendations: [
+            'Enroll device in management system',
+            'Apply security policies to device',
+            'Monitor unmanaged device access'
+          ]
+        });
+      }
+
+      // Check for old operating systems
+      if (operatingSystem.toLowerCase().includes('windows 7') || 
+          operatingSystem.toLowerCase().includes('windows 8') ||
+          operatingSystem.toLowerCase().includes('windows xp')) {
+        statistics.suspiciousDevices++;
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'Legacy Operating System Detected',
+          severity: 'high',
+          description: `Device ${deviceName} is running legacy OS: ${operatingSystem}`,
+          timestamp: new Date(),
+          source: 'device_graph_data',
+          type: 'legacy_os',
+          category: 'security',
+          affectedEntities: {
+            devices: [deviceName],
+            resources: [],
+            applications: []
+          },
+          evidence: {
+            deviceName,
+            operatingSystem,
+            lastSeenDateTime
+          },
+          mitreAttack: {
+            tactics: ['Initial Access', 'Privilege Escalation'],
+            techniques: ['T1068', 'T1078'],
+            subTechniques: ['T1068.001', 'T1078.004']
+          },
+          recommendations: [
+            'Upgrade to supported operating system',
+            'Apply security patches',
+            'Consider blocking legacy devices'
+          ]
+        });
+      }
+    }
+
+    return {
+      findings,
+      statistics,
+      summary: {
+        totalFindings: findings.length,
+        highSeverityFindings: findings.filter(f => f.severity === 'high').length,
+        mediumSeverityFindings: findings.filter(f => f.severity === 'medium').length,
+        lowSeverityFindings: findings.filter(f => f.severity === 'low').length
+      }
+    };
+  }
+
+  // Analyze User data from Microsoft Graph
+  async analyzeUserData(userData, parameters) {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    const findings = [];
+    const statistics = {
+      totalUsers: userData.length,
+      enabledUsers: 0,
+      disabledUsers: 0,
+      adminUsers: 0,
+      guestUsers: 0,
+      suspiciousUsers: 0
+    };
+
+    for (const user of userData) {
+      // Handle both PascalCase (from Get-RiskyUsers) and lowercase variations
+      const userPrincipalName = user.UserPrincipalName || user.userPrincipalName || user.user || 'Unknown';
+      const accountEnabled = user.AccountEnabled !== undefined ? user.AccountEnabled : (user.accountEnabled || false);
+      const userType = user.UserType || user.userType || 'Member';
+      const createdDateTime = user.createdDateTime || user.CreatedDateTime;
+      const lastSignInDateTime = user.lastSignInDateTime || user.LastSignInDateTime;
+
+      if (accountEnabled) {
+        statistics.enabledUsers++;
+      } else {
+        statistics.disabledUsers++;
+      }
+
+      if (userType === 'Guest') {
+        statistics.guestUsers++;
+        
+        // Create finding for guest users
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'Guest User Detected',
+          severity: 'low',
+          description: `Guest user detected: ${userPrincipalName}`,
+          timestamp: new Date(),
+          source: 'user_graph_data',
+          type: 'guest_user',
+          category: 'security',
+          affectedEntities: {
+            users: [userPrincipalName],
+            resources: [],
+            applications: []
+          },
+          evidence: {
+            userPrincipalName,
+            userType,
+            accountEnabled,
+            createdDateTime,
+            lastSignInDateTime
+          },
+          mitreAttack: {
+            tactics: ['Initial Access', 'Persistence'],
+            techniques: ['T1078', 'T1136'],
+            subTechniques: ['T1078.004', 'T1136.003']
+          },
+          recommendations: [
+            'Review guest user access permissions',
+            'Verify business justification for guest access',
+            'Monitor guest user activities'
+          ]
+        });
+      }
+
+      // Check for inactive users
+      if (lastSignInDateTime) {
+        const lastSignIn = new Date(lastSignInDateTime);
+        const daysSinceLastSignIn = (Date.now() - lastSignIn.getTime()) / (1000 * 60 * 60 * 24);
+        
+        if (daysSinceLastSignIn > 90 && accountEnabled) {
+          statistics.suspiciousUsers++;
+          findings.push({
+            id: `finding_${findings.length + 1}`,
+            title: 'Inactive User Account',
+            severity: 'medium',
+            description: `User ${userPrincipalName} has not signed in for ${Math.round(daysSinceLastSignIn)} days`,
+            timestamp: new Date(),
+            source: 'user_graph_data',
+            type: 'inactive_user',
+            category: 'security',
+            affectedEntities: {
+              users: [userPrincipalName],
+              resources: [],
+              applications: []
+            },
+            evidence: {
+              userPrincipalName,
+              lastSignInDateTime,
+              daysSinceLastSignIn: Math.round(daysSinceLastSignIn),
+              accountEnabled
+            },
+            mitreAttack: {
+              tactics: ['Defense Evasion', 'Persistence'],
+              techniques: ['T1078', 'T1136'],
+              subTechniques: ['T1078.004', 'T1136.001']
+            },
+            recommendations: [
+              'Disable inactive user accounts',
+              'Review account necessity',
+              'Implement automated account lifecycle management'
+            ]
+          });
+        }
+      }
+    }
+
+    return {
+      findings,
+      statistics,
+      summary: {
+        totalFindings: findings.length,
+        highSeverityFindings: findings.filter(f => f.severity === 'high').length,
+        mediumSeverityFindings: findings.filter(f => f.severity === 'medium').length,
+        lowSeverityFindings: findings.filter(f => f.severity === 'low').length
+      }
+    };
+  }
+
+  // Analyze License data from Microsoft Graph
+  async analyzeLicenseData(licenseData, parameters) {
+    if (!this.initialized) {
+      await this.initialize();
+    }
+
+    const findings = [];
+    const statistics = {
+      totalLicenses: licenseData.length,
+      activeLicenses: 0,
+      expiredLicenses: 0,
+      underutilizedLicenses: 0,
+      suspiciousLicenses: 0
+    };
+
+    for (const license of licenseData) {
+      // Get-Licenses uses 'Sku' field, not skuPartNumber
+      const skuName = license.Sku || license.skuPartNumber || license.SkuPartNumber || 'Unknown';
+      // Get-Licenses exports: Units, Status, Retention, E3, E5, P1, P2, etc.
+      const consumedUnits = license.Units || license.consumedUnits || license.ConsumedUnits || 0;
+      const status = license.Status || license.status || 'Unknown';
+      const prepaidUnits = license.prepaidUnits || license.PrepaidUnits || {};
+      const enabled = prepaidUnits.enabled || prepaidUnits.Enabled || consumedUnits;
+      const expired = prepaidUnits.expired || prepaidUnits.Expired || 0;
+      const suspended = prepaidUnits.suspended || prepaidUnits.Suspended || 0;
+
+      if (enabled > 0) {
+        statistics.activeLicenses++;
+      }
+
+      if (expired > 0) {
+        statistics.expiredLicenses++;
+        
+        // Create finding for expired licenses
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'Expired Licenses Detected',
+          severity: 'medium',
+          description: `License ${skuName} has ${expired} expired units`,
+          timestamp: new Date(),
+          source: 'license_graph_data',
+          type: 'expired_license',
+          category: 'compliance',
+          affectedEntities: {
+            licenses: [skuName],
+            resources: [],
+            applications: []
+          },
+          evidence: {
+            skuName,
+            consumedUnits,
+            enabledUnits: enabled,
+            expiredUnits: expired,
+            suspendedUnits: suspended
+          },
+          mitreAttack: {
+            tactics: ['Resource Development'],
+            techniques: ['T1583'],
+            subTechniques: ['T1583.001']
+          },
+          recommendations: [
+            'Renew expired licenses',
+            'Review license usage patterns',
+            'Implement license monitoring'
+          ]
+        });
+      }
+
+      // Check for underutilized licenses
+      if (enabled > 0 && consumedUnits < enabled * 0.5) {
+        statistics.underutilizedLicenses++;
+        findings.push({
+          id: `finding_${findings.length + 1}`,
+          title: 'Underutilized License Detected',
+          severity: 'low',
+          description: `License ${skuName} is underutilized: ${consumedUnits}/${enabled} units used`,
+          timestamp: new Date(),
+          source: 'license_graph_data',
+          type: 'underutilized_license',
+          category: 'optimization',
+          affectedEntities: {
+            licenses: [skuName],
+            resources: [],
+            applications: []
+          },
+          evidence: {
+            skuName,
+            consumedUnits,
+            enabledUnits: enabled,
+            utilizationRate: (consumedUnits / enabled) * 100
+          },
+          mitreAttack: {
+            tactics: ['Resource Development'],
+            techniques: ['T1583'],
+            subTechniques: ['T1583.001']
+          },
+          recommendations: [
+            'Optimize license allocation',
+            'Consider reducing license count',
+            'Review user license assignments'
+          ]
+        });
+      }
+    }
+
+    return {
+      findings,
+      statistics,
+      summary: {
+        totalFindings: findings.length,
+        highSeverityFindings: findings.filter(f => f.severity === 'high').length,
+        mediumSeverityFindings: findings.filter(f => f.severity === 'medium').length,
+        lowSeverityFindings: findings.filter(f => f.severity === 'low').length
+      }
+    };
   }
 }
 
