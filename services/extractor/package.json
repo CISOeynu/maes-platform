@@ -8,10 +8,10 @@
     "dev": "nodemon src/index.js"
   },
   "dependencies": {
-    "@azure/msal-node": "^2.13.1",
+    "@azure/msal-node": "^5.2.2",
     "@microsoft/microsoft-graph-client": "^3.0.7",
-    "axios": "^1.15.0",
-    "bullmq": "^5.0.0",
+    "axios": "^1.16.0",
+    "bullmq": "^5.78.0",
     "dotenv": "^17.2.0",
     "express": "^4.22.1",
     "ioredis": "^5.6.1",
